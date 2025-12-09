@@ -9,3 +9,5 @@ Cargo.lock
 *.egg-info/
 __pycache__/
 *.pyc
+
+.DS_Store
