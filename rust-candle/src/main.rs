@@ -1,5 +1,5 @@
 use candle_core::{DType, Device, Result, Tensor};
-use candle_nn::{Linear, Module, Optimizer, SGD, VarBuilder, VarMap, linear, loss, ops};
+use candle_nn::{Linear, Module, VarBuilder, VarMap, linear, ops};
 
 mod utils;
 use rand::seq::SliceRandom;
@@ -134,7 +134,7 @@ impl<'a> Iterator for DataLoader<'a> {
 fn main() -> Result<()> {
     let device = Device::new_metal(0).expect("Metal Not Found");
 
-    let varmap = VarMap::new();
+    let mut varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
     let model = SimpleModel::new(vb, 2, 20, 2)?;
     let _ = print_varmap(&varmap);
@@ -150,30 +150,30 @@ fn main() -> Result<()> {
 
     let train_dataset = DemoDataset::new(x_train, y_train)?;
     let val_dataset = DemoDataset::new(x_val, y_val)?;
-    let mut train_loader = DataLoader::new(train_dataset, 2, true)?;
+    let mut train_loader = DataLoader::new(train_dataset, 5, true)?;
     let mut val_loader = DataLoader::new(val_dataset, 2, false)?;
-    let mut sgd = SGD::new(varmap.all_vars(), 0.01)?;
-    let epochs = 3;
+    // let mut sgd = SGD::new(varmap.all_vars(), 0.01)?;
+    // let epochs = 3;
 
-    for epoch in 0..epochs {
-        let _ = train_loader.reset();
-        let _ = val_loader.reset();
+    // for epoch in 0..epochs {
+    //     let _ = train_loader.reset();
+    //     let _ = val_loader.reset();
 
-        for batch in &mut train_loader {
-            let (x_, y_) = batch?;
-            let predict = model.forward(&x_)?;
-            let loss_ = loss::cross_entropy(&predict, &y_)?;
-            sgd.backward_step(&loss_)?;
-            println!("Epoch: {epoch} train loss: {loss_}");
-        }
+    //     for batch in &mut train_loader {
+    //         let (x_, y_) = batch?;
+    //         let predict = model.forward(&x_)?;
+    //         let loss_ = loss::cross_entropy(&predict, &y_)?;
+    //         sgd.backward_step(&loss_)?;
+    //         println!("Epoch: {epoch} train loss: {loss_}");
+    //     }
 
-        for batch in &mut val_loader {
-            let (x_, y_) = batch?;
-            let predict = model.forward(&x_)?;
-            let loss_ = loss::cross_entropy(&predict, &y_)?;
-            println!("Epoch: {epoch} val loss: {loss_}");
-        }
-    }
+    //     for batch in &mut val_loader {
+    //         let (x_, y_) = batch?;
+    //         let predict = model.forward(&x_)?;
+    //         let loss_ = loss::cross_entropy(&predict, &y_)?;
+    //         println!("Epoch: {epoch} val loss: {loss_}");
+    //     }
+    // }
 
     let _ = train_loader.reset();
     let _ = val_loader.reset();
@@ -212,7 +212,43 @@ fn main() -> Result<()> {
         )
     }
 
-    varmap.save("model.safetensors")?;
+    varmap.load("model.safetensors")?;
+    let _ = train_loader.reset();
+    let _ = val_loader.reset();
+
+    for batch in &mut train_loader {
+        let (x_, y_) = batch?;
+        let predict = model.forward(&x_)?;
+        let softmax = ops::softmax(&predict, 1)?;
+        let label = softmax.argmax(1)?;
+        println!("train label: {}", label);
+        println!("true label: {}", y_);
+        println!(
+            "train acc: {}",
+            label
+                .eq(&y_)?
+                .sum(0)?
+                .to_dtype(DType::F32)?
+                .affine(1.0 / (x_.dim(0)? as f64), 0.0)?
+        )
+    }
+
+    for batch in &mut val_loader {
+        let (x_, y_) = batch?;
+        let predict = model.forward(&x_)?;
+        let softmax = ops::softmax(&predict, 1)?;
+        let label = softmax.argmax(1)?;
+        println!("val label: {}", label);
+        println!("true label: {}", y_);
+        println!(
+            "val acc: {}",
+            label
+                .eq(&y_)?
+                .sum(0)?
+                .to_dtype(DType::F32)?
+                .affine(1.0 / (x_.dim(0)? as f64), 0.0)?
+        )
+    }
 
     Ok(())
 }
