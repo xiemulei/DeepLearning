@@ -1,5 +1,5 @@
-use candle_core::{DType, Device, Result, Tensor, Var};
-use candle_nn::{Linear, Module, VarBuilder, VarMap, linear};
+use candle_core::{DType, Device, Result, Tensor};
+use candle_nn::{Linear, Module, Optimizer, SGD, VarBuilder, VarMap, linear, loss, ops};
 
 mod utils;
 use rand::seq::SliceRandom;
@@ -134,44 +134,85 @@ impl<'a> Iterator for DataLoader<'a> {
 fn main() -> Result<()> {
     let device = Device::new_metal(0).expect("Metal Not Found");
 
-    let mut varmap = VarMap::new();
+    let varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-
     let model = SimpleModel::new(vb, 2, 20, 2)?;
-    // let _ = print_varmap(&varmap);
+    let _ = print_varmap(&varmap);
 
-    let x_vec = vec![-1.2f32, 3.1, -0.9, 2.9, -0.5, 2.6, 2.3, -1.1, 2.7, -1.5];
-    let x_train = Tensor::from_vec(x_vec, (5, 2), &device)?;
-    let y_vec = vec![0u32, 0, 0, 1, 1];
-    let y_train = Tensor::from_vec(y_vec, 5, &device)?;
-
-    // let y_predict = model.forward(&x_train)?;
-    // println!("{}", y_predict);
+    let x_train = Tensor::from_vec(
+        vec![-1.2f32, 3.1, -0.9, 2.9, -0.5, 2.6, 2.3, -1.1, 2.7, -1.5],
+        (5, 2),
+        &device,
+    )?;
+    let y_train = Tensor::from_vec(vec![0u32, 0, 0, 1, 1], 5, &device)?;
+    let x_val = Tensor::from_vec(vec![-0.8f32, 2.8, 2.6, -1.6], (2, 2), &device)?;
+    let y_val = Tensor::from_vec(vec![0u32, 1], (2,), &device)?;
 
     let train_dataset = DemoDataset::new(x_train, y_train)?;
-    let len = train_dataset.len()?;
-    println!("dataset len:{}", len);
+    let val_dataset = DemoDataset::new(x_val, y_val)?;
+    let mut train_loader = DataLoader::new(train_dataset, 2, true)?;
+    let mut val_loader = DataLoader::new(val_dataset, 2, false)?;
+    let mut sgd = SGD::new(varmap.all_vars(), 0.01)?;
+    let epochs = 3;
 
-    // let (x_, y_) = train_dataset.get_idx(0)?;
-    // println!("{}", x_);
-    // println!("{}", y_);
+    for epoch in 0..epochs {
+        let _ = train_loader.reset();
+        let _ = val_loader.reset();
 
-    // let (x_, y_) = train_dataset.get_batch(0, 5)?;
-    // println!("{}", x_);
-    // println!("{}", y_);
+        for batch in &mut train_loader {
+            let (x_, y_) = batch?;
+            let predict = model.forward(&x_)?;
+            let loss_ = loss::cross_entropy(&predict, &y_)?;
+            sgd.backward_step(&loss_)?;
+            println!("Epoch: {epoch} train loss: {loss_}");
+        }
 
-    // let _ = train_dataset.shuffle()?;
-    // let (x_, y_) = train_dataset.get_batch(0, 5)?;
-    // println!("{}", x_);
-    // println!("{}", y_);
-
-    let mut dataloader = DataLoader::new(train_dataset, 1, true)?;
-    dataloader.reset()?;
-    for (idx, batch) in dataloader.enumerate() {
-        println!("loader idx: {idx}");
-        let (x_, y_) = batch?;
-        println!("{}", x_);
-        println!("{}", y_);
+        for batch in &mut val_loader {
+            let (x_, y_) = batch?;
+            let predict = model.forward(&x_)?;
+            let loss_ = loss::cross_entropy(&predict, &y_)?;
+            println!("Epoch: {epoch} val loss: {loss_}");
+        }
     }
+
+    let _ = train_loader.reset();
+    let _ = val_loader.reset();
+
+    for batch in &mut train_loader {
+        let (x_, y_) = batch?;
+        let predict = model.forward(&x_)?;
+        let softmax = ops::softmax(&predict, 1)?;
+        let label = softmax.argmax(1)?;
+        println!("train label: {}", label);
+        println!("true label: {}", y_);
+        println!(
+            "train acc: {}",
+            label
+                .eq(&y_)?
+                .sum(0)?
+                .to_dtype(DType::F32)?
+                .affine(1.0 / (x_.dim(0)? as f64), 0.0)?
+        )
+    }
+
+    for batch in &mut val_loader {
+        let (x_, y_) = batch?;
+        let predict = model.forward(&x_)?;
+        let softmax = ops::softmax(&predict, 1)?;
+        let label = softmax.argmax(1)?;
+        println!("val label: {}", label);
+        println!("true label: {}", y_);
+        println!(
+            "val acc: {}",
+            label
+                .eq(&y_)?
+                .sum(0)?
+                .to_dtype(DType::F32)?
+                .affine(1.0 / (x_.dim(0)? as f64), 0.0)?
+        )
+    }
+
+    varmap.save("model.safetensors")?;
+
     Ok(())
 }
