@@ -94,8 +94,8 @@ pub fn write_file(file_path: &str, string: String) {
 }
 
 #[allow(unused)]
-pub fn read_txt(txt_path: &str) -> String {
-    let mut file = File::open(txt_path).expect("open file error");
+pub fn read_text(text_path: &str) -> String {
+    let mut file = File::open(text_path).expect("open file error");
     let mut content = String::new();
     let _ = file.read_to_string(&mut content);
     content

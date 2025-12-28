@@ -1,9 +1,11 @@
+use core::f32;
+
 use candle_core::{D, Device, Error, Result, Tensor};
-use candle_nn::{Module, VarBuilder, VarMap, embedding, linear};
+use candle_nn::{Linear, Module, VarBuilder, VarMap, embedding, linear_no_bias, ops};
 use rand::seq::SliceRandom;
 use tokenizers::Tokenizer;
 
-use crate::utils::{Dataset, file::read_txt};
+use crate::utils::{DataLoader, Dataset, file::read_text};
 
 mod chapter2;
 mod chapter3;
@@ -72,11 +74,11 @@ impl Dataset for TokenDataset {
     }
 }
 
-pub struct SinCosinePositionEmbedding {
+pub struct SinusoidalPositionEmbedding {
     pub pos_embedding: Tensor,
 }
 
-impl SinCosinePositionEmbedding {
+impl SinusoidalPositionEmbedding {
     pub fn new(seq_len: usize, hidden_dim: usize, device: &Device) -> Result<Self> {
         assert_eq!(hidden_dim % 2, 0, "hidden_dim must be even");
 
@@ -236,51 +238,98 @@ impl RoPE {
     }
 }
 
+pub struct DotProductAttention {
+    w_q: Linear,
+    w_k: Linear,
+    w_v: Linear,
+    d_sqrt: Tensor,
+}
+
+pub fn mask_filled(on_true: &Tensor, mask: &Tensor, on_false: f32) -> Result<Tensor> {
+    let mask = mask.broadcast_as(on_true.shape())?;
+    let on_false = Tensor::new(on_false, on_true.device())?.broadcast_as(on_true.shape())?;
+    println!("{:?}", on_false);
+    let filled = mask.where_cond(on_true, &on_false)?;
+    Ok(filled)
+}
+
+impl DotProductAttention {
+    pub fn new(vb: VarBuilder, in_dim: usize, out_dim: usize, device: &Device) -> Result<Self> {
+        let w_q = linear_no_bias(in_dim, out_dim, vb.pp("w_q"))?;
+        let w_k = linear_no_bias(in_dim, out_dim, vb.pp("w_k"))?;
+        let w_v = linear_no_bias(in_dim, out_dim, vb.pp("w_v"))?;
+        let d_sqrt = 1.0 / (out_dim as f32).sqrt();
+        let d_sqrt = Tensor::new(d_sqrt, device)?;
+        Ok(Self {
+            w_q,
+            w_k,
+            w_v,
+            d_sqrt,
+        })
+    }
+
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let q = self.w_q.forward(x)?;
+        let k = self.w_k.forward(x)?;
+        let v = self.w_v.forward(x)?;
+        let atten_score = q.matmul(&k.t()?)?;
+        let atten_score = atten_score.broadcast_mul(&self.d_sqrt)?;
+        let softmax = ops::softmax(&atten_score, D::Minus1)?;
+        let atten_weight = softmax.matmul(&v)?;
+        Ok(atten_weight)
+    }
+
+    pub fn forward_with_mask(&self, x: &Tensor, mask: bool) -> Result<Tensor> {
+        let (_, seq_len, _) = x.dims3()?;
+        let q = self.w_q.forward(x)?;
+        let k = self.w_k.forward(x)?;
+        let v = self.w_v.forward(x)?;
+
+        // 计算 attention score: q 和 k 的转置相乘
+        let mut atten_score = q.matmul(&k.t()?)?; // [batch_size, seq_len, seq_len]
+
+        if mask {
+            let mask = Tensor::tril2(seq_len, candle_core::DType::U32, x.device())?;
+            println!("mask: {:?}", mask);
+            atten_score = mask_filled(&atten_score, &mask, f32::NEG_INFINITY)?;
+        }
+
+        let atten_score = atten_score.broadcast_mul(&self.d_sqrt)?;
+        let softmax = ops::softmax(&atten_score, D::Minus1)?;
+        let atten_weight = softmax.matmul(&v)?;
+        Ok(atten_weight)
+    }
+}
+
 fn main() -> Result<()> {
     let device = Device::metal_if_available(0)?;
 
-    // let txt = read_txt("src/assets/sub_wiki_0_99.txt");
+    let text = read_text("src/assets/sub_wiki_0_99.txt");
     let tokenizer = Tokenizer::from_file("src/assets/tokenizer.json")
         .map_err(|e| Error::Msg(format!("tokenizer from file error {}", e)))?;
-    // let token_dataset = TokenDataset::new(txt, &tokenizer, 32, 32, &device)?;
-    // let (x, y) = token_dataset.get_batch(0, 1)?;
-    // println!("{}", x);
-    // println!("{}", y);
-
     let vocab_size = tokenizer.get_vocab_size(true);
-    let encoding = tokenizer
-        .encode("你好，你好可爱啊", true)
-        .map_err(|e| Error::Msg(format!("tokenizer encoding error: {}", e)))?;
-    let tokens_id = encoding.get_ids();
-    println!("{:?}", tokens_id);
 
+    let seq_len = 32;
+    let stride = 32;
+    let batch_size = 2;
+    let token_dataset = TokenDataset::new(text, &tokenizer, seq_len, stride, &device)?;
+    let mut dataloader = DataLoader::new(token_dataset, batch_size, true)?;
+    let _ = dataloader.reset()?;
+    let (x, _y) = dataloader.next().unwrap()?;
+
+    let embedding_dim = 256;
     let varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &device);
-    let embedding_dim = 8;
     let embedding = embedding(vocab_size, embedding_dim, vb.pp("embedding"))?;
-    let token_tensor = Tensor::new(tokens_id, &device)?;
-    let token_tensor = token_tensor.unsqueeze(0)?;
-    let token_tensor = Tensor::cat(&[&token_tensor, &token_tensor], 0)?;
-    let embeded = embedding.forward(&token_tensor)?;
-    // let pos_embedding = SinCosinePositionEmbedding::new(5, 32, &device)?.pos_embedding;
-    // println!("{}", pos_embedding);
-    // let embeded = embeded.add(&pos_embedding)?;
-    println!("embeded: {}", embeded);
-
-    let linear1 = linear(embedding_dim, embedding_dim, vb.pp("w_q"))?;
-    let linear2 = linear(embedding_dim, embedding_dim, vb.pp("w_k"))?;
-    let linear3 = linear(embedding_dim, embedding_dim, vb.pp("w_v"))?;
-
-    let q = linear1.forward(&embeded)?;
-    let k = linear2.forward(&embeded)?;
-    let v = linear3.forward(&embeded)?;
-
-    let rope = RoPE::new0_half(5, embedding_dim, &device)?;
-    let q = rope.forward0_half(&q)?;
-    let k = rope.forward0_half(&k)?;
-
-    let atten_score = q.matmul(&k.t()?)?;
-    println!("{}", atten_score);
+    let encode = embedding.forward(&x)?;
+    let pos_embedding =
+        SinusoidalPositionEmbedding::new(seq_len, embedding_dim, &device)?.pos_embedding;
+    let encode = encode.broadcast_add(&pos_embedding)?;
+    let attention1 =
+        DotProductAttention::new(vb.pp("attention1"), embedding_dim, embedding_dim, &device)?;
+    // let output = attention1.forward(&encode)?;
+    let output = attention1.forward_with_mask(&encode, true)?;
+    println!("{:?}", output);
 
     Ok(())
 }
