@@ -1,8 +1,9 @@
 use core::f32;
+use std::collections::HashMap;
 
-use candle_core::{D, Device, Error, Result, Tensor};
+use candle_core::{D, DType, Device, Error, Result, Tensor};
 use candle_nn::{Linear, Module, VarBuilder, VarMap, embedding, linear_no_bias, ops};
-use rand::seq::{self, SliceRandom};
+use rand::seq::SliceRandom;
 use tokenizers::Tokenizer;
 
 use crate::utils::{DataLoader, Dataset, file::read_text};
@@ -108,24 +109,6 @@ impl RoPE {
     pub fn new(seq_len: usize, embedding_dim: usize, device: &Device) -> Result<Self> {
         assert_eq!(embedding_dim % 2, 0, "hidden_dim must be even");
 
-        let mut angle = Vec::new();
-        for pos in 0..seq_len {
-            for i in (0..embedding_dim).step_by(2) {
-                let pos_i = pos as f32 / 10000.0_f32.powf(i as f32 / embedding_dim as f32);
-                angle.extend_from_slice(&[pos_i, pos_i]);
-            }
-        }
-
-        let angle_tensor = Tensor::from_vec(angle, (seq_len, embedding_dim), device)?;
-        let cos = angle_tensor.cos()?;
-        let sin = angle_tensor.sin()?;
-
-        Ok(Self { sin, cos })
-    }
-
-    pub fn new0_half(seq_len: usize, embedding_dim: usize, device: &Device) -> Result<Self> {
-        assert_eq!(embedding_dim % 2, 0, "hidden_dim must be even");
-
         // let mut angle = Vec::new();
         // for pos in 0..seq_len {
         //     for i in (0..embedding_dim).step_by(2) {
@@ -149,7 +132,7 @@ impl RoPE {
         Ok(Self { sin, cos })
     }
 
-    pub fn forward0_half(&self, x: &Tensor) -> Result<Tensor> {
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         println!("x: {x}");
         let x_cos = x.broadcast_mul(&self.cos)?;
         let dims = x.dims();
@@ -164,6 +147,24 @@ impl RoPE {
         Ok(rotate)
     }
 
+    pub fn new_reformer(seq_len: usize, embedding_dim: usize, device: &Device) -> Result<Self> {
+        assert_eq!(embedding_dim % 2, 0, "hidden_dim must be even");
+
+        let mut angle = Vec::new();
+        for pos in 0..seq_len {
+            for i in (0..embedding_dim).step_by(2) {
+                let pos_i = pos as f32 / 10000.0_f32.powf(i as f32 / embedding_dim as f32);
+                angle.extend_from_slice(&[pos_i, pos_i]);
+            }
+        }
+
+        let angle_tensor = Tensor::from_vec(angle, (seq_len, embedding_dim), device)?;
+        let cos = angle_tensor.cos()?;
+        let sin = angle_tensor.sin()?;
+
+        Ok(Self { sin, cos })
+    }
+
     /// RoPE (Rotary Position Embedding) 前向传播
     ///
     /// RoPE 核心公式: RoPE(x, m) = x * cos(mθ) + rotate(x) * sin(mθ)
@@ -174,7 +175,7 @@ impl RoPE {
     ///
     /// 返回:
     ///   应用 RoPE 旋转后的张量
-    pub fn forward(&self, x: Tensor) -> Result<Tensor> {
+    pub fn forward_reformer(&self, x: &Tensor) -> Result<Tensor> {
         // 步骤1: 计算 x * cos(mθ) 部分
         // 使用广播机制将 cos 值与输入张量相乘
         // x 形状: [batch_size, seq_len, embedding_dim]
@@ -302,6 +303,33 @@ impl DotProductAttention {
     }
 }
 
+pub struct SharedBuffer {
+    buffers: HashMap<String, (Tensor, RoPE)>,
+}
+
+impl SharedBuffer {
+    pub fn new() -> Result<Self> {
+        let buffers: HashMap<String, (Tensor, RoPE)> = HashMap::new();
+        Ok(Self { buffers })
+    }
+
+    pub fn get(&mut self, seq_len: usize, dim: usize, device: &Device) -> Result<&(Tensor, RoPE)> {
+        let key = format!("{seq_len}_{dim}");
+        if !self.buffers.contains_key(&key) {
+            let mask = Tensor::tril2(seq_len, DType::U32, device)?;
+            let rope = RoPE::new(seq_len, dim, device)?;
+            self.buffers.insert(key.clone(), (mask, rope));
+        }
+
+        let value = self
+            .buffers
+            .get(&key)
+            .ok_or(Error::Msg(format!("get mask rope key: {} None", key)))?;
+
+        Ok(value)
+    }
+}
+
 pub struct MultiHeadAttention {
     w_q: Linear,
     w_k: Linear,
@@ -377,6 +405,87 @@ impl MultiHeadAttention {
         let out = self.out_proj.forward(&atten_weight)?;
         Ok(out)
     }
+
+    pub fn forward_with_rope(&self, x: &Tensor, mask: bool) -> Result<Tensor> {
+        let (bs, seq_len, _) = x.dims3()?;
+        // (bs, n_head, seq_len, head_dim)
+        let q = self
+            .w_q
+            .forward(x)?
+            .reshape((bs, seq_len, self.n_head, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let k = self
+            .w_k
+            .forward(x)?
+            .reshape((bs, seq_len, self.n_head, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let v = self
+            .w_v
+            .forward(x)?
+            .reshape((bs, seq_len, self.n_head, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let rope = RoPE::new(seq_len, self.head_dim, x.device())?;
+        let q = rope.forward(&q)?;
+        let k = rope.forward(&k)?;
+        let v = rope.forward(&v)?;
+        let mut atten_score = q.matmul(&k.t()?)?;
+        if mask {
+            let mask = Tensor::tril2(seq_len, candle_core::DType::U32, x.device())?;
+            atten_score = mask_filled(&atten_score, &mask, f32::NEG_INFINITY)?;
+            println!("{}", atten_score);
+        }
+        let atten_score = atten_score.broadcast_mul(&self.d_sqrt)?;
+        // (bs, n_head, seq_len, seq_len)
+        let softmax = ops::softmax(&atten_score, D::Minus1)?;
+        let atten_weight = softmax.matmul(&v)?; // (bs, n_head, seq_len, head_dim)
+        let atten_weight = atten_weight
+            .transpose(1, 2)?
+            .reshape((bs, seq_len, self.out_dim))?;
+        let out = self.out_proj.forward(&atten_weight)?;
+        Ok(out)
+    }
+
+    pub fn forward_with_buffer(&self, x: &Tensor, buffer: &mut SharedBuffer) -> Result<Tensor> {
+        let (bs, seq_len, _) = x.dims3()?;
+        // (bs, n_head, seq_len, head_dim)
+        let q = self
+            .w_q
+            .forward(x)?
+            .reshape((bs, seq_len, self.n_head, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let k = self
+            .w_k
+            .forward(x)?
+            .reshape((bs, seq_len, self.n_head, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let v = self
+            .w_v
+            .forward(x)?
+            .reshape((bs, seq_len, self.n_head, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+
+        let (mask, rope) = buffer.get(seq_len, self.head_dim, x.device())?;
+        let q = rope.forward(&q)?;
+        let k = rope.forward(&k)?;
+        let v = rope.forward(&v)?;
+        let mut atten_score = q.matmul(&k.t()?)?;
+        atten_score = mask_filled(&atten_score, mask, f32::NEG_INFINITY)?;
+        println!("{}", atten_score);
+        let atten_score = atten_score.broadcast_mul(&self.d_sqrt)?;
+        let softmax = ops::softmax(&atten_score, D::Minus1)?;
+        let atten_weight = softmax.matmul(&v)?; // (bs, n_head, seq_len, head_dim)
+        let atten_weight = atten_weight
+            .transpose(1, 2)?
+            .reshape((bs, seq_len, self.out_dim))?;
+        let out = self.out_proj.forward(&atten_weight)?;
+        Ok(out)
+    }
 }
 
 fn main() -> Result<()> {
@@ -400,16 +509,11 @@ fn main() -> Result<()> {
     let vb = VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &device);
     let embedding = embedding(vocab_size, embedding_dim, vb.pp("embedding"))?;
     let encode = embedding.forward(&x)?;
-    let pos_embedding =
-        SinusoidalPositionEmbedding::new(seq_len, embedding_dim, &device)?.pos_embedding;
-    let encode = encode.broadcast_add(&pos_embedding)?;
-    // let attention1 =
-        // DotProductAttention::new(vb.pp("attention1"), embedding_dim, embedding_dim, &device)?;
-    // let output = attention1.forward(&encode)?;
-    // let output = attention1.forward_with_mask(&encode, true)?;
     let n_head = 4;
-    let mha = MultiHeadAttention::new(vb.pp("mha1"), embedding_dim, embedding_dim, n_head, &device)?;
-    let output = mha.forward(&encode, true)?;
+    let mha =
+        MultiHeadAttention::new(vb.pp("mha1"), embedding_dim, embedding_dim, n_head, &device)?;
+    let mut buffer = SharedBuffer::new()?;
+    let output = mha.forward_with_buffer(&encode, &mut buffer)?;
     println!("{:?}", output);
 
     Ok(())
