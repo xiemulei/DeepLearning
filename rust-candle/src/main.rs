@@ -2,7 +2,7 @@ use core::f32;
 
 use candle_core::{D, Device, Error, Result, Tensor};
 use candle_nn::{Linear, Module, VarBuilder, VarMap, embedding, linear_no_bias, ops};
-use rand::seq::SliceRandom;
+use rand::seq::{self, SliceRandom};
 use tokenizers::Tokenizer;
 
 use crate::utils::{DataLoader, Dataset, file::read_text};
@@ -66,9 +66,9 @@ impl Dataset for TokenDataset {
         let mut indices: Vec<u32> = (0..len).map(|i| i as u32).collect();
         let mut rng = rand::rng();
         indices.shuffle(&mut rng);
-        let indices_tensot = Tensor::from_vec(indices, (len,), self.input_ids.device())?;
-        self.input_ids = self.input_ids.index_select(&indices_tensot, 0)?;
-        self.target_ids = self.target_ids.index_select(&indices_tensot, 0)?;
+        let indices_tensor = Tensor::from_vec(indices, (len,), self.input_ids.device())?;
+        self.input_ids = self.input_ids.index_select(&indices_tensor, 0)?;
+        self.target_ids = self.target_ids.index_select(&indices_tensor, 0)?;
 
         Ok(())
     }
@@ -260,6 +260,7 @@ impl DotProductAttention {
         let w_v = linear_no_bias(in_dim, out_dim, vb.pp("w_v"))?;
         let d_sqrt = 1.0 / (out_dim as f32).sqrt();
         let d_sqrt = Tensor::new(d_sqrt, device)?;
+
         Ok(Self {
             w_q,
             w_k,
@@ -301,6 +302,83 @@ impl DotProductAttention {
     }
 }
 
+pub struct MultiHeadAttention {
+    w_q: Linear,
+    w_k: Linear,
+    w_v: Linear,
+    out_proj: Linear,
+    n_head: usize,
+    head_dim: usize,
+    out_dim: usize,
+    d_sqrt: Tensor,
+}
+
+impl MultiHeadAttention {
+    pub fn new(
+        vb: VarBuilder,
+        in_dim: usize,
+        out_dim: usize,
+        n_head: usize,
+        device: &Device,
+    ) -> Result<Self> {
+        let w_q = linear_no_bias(in_dim, out_dim, vb.pp("w_q"))?;
+        let w_k = linear_no_bias(in_dim, out_dim, vb.pp("w_k"))?;
+        let w_v = linear_no_bias(in_dim, out_dim, vb.pp("w_v"))?;
+        let out_proj = linear_no_bias(out_dim, out_dim, vb.pp("out_proj"))?;
+        let head_dim = out_dim / n_head;
+        let d_sqrt = 1.0 / (head_dim as f32).sqrt();
+        let d_sqrt = Tensor::new(d_sqrt, device)?;
+
+        Ok(Self {
+            w_q,
+            w_k,
+            w_v,
+            out_proj,
+            n_head,
+            head_dim,
+            out_dim,
+            d_sqrt,
+        })
+    }
+
+    pub fn forward(&self, x: &Tensor, mask: bool) -> Result<Tensor> {
+        let (bs, seq_len, _) = x.dims3()?;
+        // (bs, n_head, seq_len, head_dim)
+        let q = self
+            .w_q
+            .forward(x)?
+            .reshape((bs, seq_len, self.n_head, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let k = self
+            .w_k
+            .forward(x)?
+            .reshape((bs, seq_len, self.n_head, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let v = self
+            .w_v
+            .forward(x)?
+            .reshape((bs, seq_len, self.n_head, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let mut atten_score = q.matmul(&k.t()?)?;
+        if mask {
+            let mask = Tensor::tril2(seq_len, candle_core::DType::U32, x.device())?;
+            atten_score = mask_filled(&atten_score, &mask, f32::NEG_INFINITY)?;
+            println!("{}", atten_score);
+        }
+        let atten_score = atten_score.broadcast_mul(&self.d_sqrt)?;
+        let softmax = ops::softmax(&atten_score, D::Minus1)?;
+        let atten_weight = softmax.matmul(&v)?; // (bs, n_head, seq_len, head_dim)
+        let atten_weight = atten_weight
+            .transpose(1, 2)?
+            .reshape((bs, seq_len, self.out_dim))?;
+        let out = self.out_proj.forward(&atten_weight)?;
+        Ok(out)
+    }
+}
+
 fn main() -> Result<()> {
     let device = Device::metal_if_available(0)?;
 
@@ -317,7 +395,7 @@ fn main() -> Result<()> {
     let _ = dataloader.reset()?;
     let (x, _y) = dataloader.next().unwrap()?;
 
-    let embedding_dim = 256;
+    let embedding_dim = 32;
     let varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &device);
     let embedding = embedding(vocab_size, embedding_dim, vb.pp("embedding"))?;
@@ -325,10 +403,13 @@ fn main() -> Result<()> {
     let pos_embedding =
         SinusoidalPositionEmbedding::new(seq_len, embedding_dim, &device)?.pos_embedding;
     let encode = encode.broadcast_add(&pos_embedding)?;
-    let attention1 =
-        DotProductAttention::new(vb.pp("attention1"), embedding_dim, embedding_dim, &device)?;
+    // let attention1 =
+        // DotProductAttention::new(vb.pp("attention1"), embedding_dim, embedding_dim, &device)?;
     // let output = attention1.forward(&encode)?;
-    let output = attention1.forward_with_mask(&encode, true)?;
+    // let output = attention1.forward_with_mask(&encode, true)?;
+    let n_head = 4;
+    let mha = MultiHeadAttention::new(vb.pp("mha1"), embedding_dim, embedding_dim, n_head, &device)?;
+    let output = mha.forward(&encode, true)?;
     println!("{:?}", output);
 
     Ok(())
