@@ -2,7 +2,7 @@ use core::f32;
 use std::collections::HashMap;
 
 use candle_core::{D, DType, Device, Error, IndexOp, Result, Tensor};
-use candle_nn::{Linear, Module, VarBuilder, VarMap, embedding, linear_no_bias, ops};
+use candle_nn::{Init, Linear, Module, VarBuilder, VarMap, embedding, linear_no_bias, ops};
 use rand::seq::SliceRandom;
 use tokenizers::Tokenizer;
 
@@ -35,13 +35,13 @@ impl TokenDataset {
     ) -> Result<Self> {
         // 使用分词器将文本转换为 token ID
         let encode = tokenizer
-            .encode(text, true)  // 添加特殊标记
+            .encode(text, true) // 添加特殊标记
             .map_err(|e| Error::Msg(format!("tokenizer encode error: {}", e)))?;
-        let token_ids = encode.get_ids();  // 获取 token ID 列表
-        let token_len = token_ids.len();   // 获取 token 总长度
-        let max_token_id = token_len - seq_len;  // 计算最大起始位置
+        let token_ids = encode.get_ids(); // 获取 token ID 列表
+        let token_len = token_ids.len(); // 获取 token 总长度
+        let max_token_id = token_len - seq_len; // 计算最大起始位置
 
-        let mut input_ids_vec = Vec::new();  // 存储输入 ID 的向量
+        let mut input_ids_vec = Vec::new(); // 存储输入 ID 的向量
         let mut target_ids_vec = Vec::new(); // 存储目标 ID 的向量
 
         // 滑动窗口生成输入-目标对
@@ -68,7 +68,7 @@ impl TokenDataset {
 impl Dataset for TokenDataset {
     // 获取数据集长度（批次数量）
     fn len(&self) -> Result<usize> {
-        Ok(self.input_ids.dim(0)?)  // 获取第一个维度的大小（批次维度）
+        Ok(self.input_ids.dim(0)?) // 获取第一个维度的大小（批次维度）
     }
 
     // 获取指定范围的批次数据
@@ -86,11 +86,11 @@ impl Dataset for TokenDataset {
 
     // 随机打乱数据集
     fn shuffle(&mut self) -> Result<()> {
-        let len = self.len()?;  // 获取数据集长度
+        let len = self.len()?; // 获取数据集长度
         // 创建索引向量 [0, 1, 2, ..., len-1]
         let mut indices: Vec<u32> = (0..len).map(|i| i as u32).collect();
-        let mut rng = rand::rng();  // 获取随机数生成器
-        indices.shuffle(&mut rng);  // 随机打乱索引
+        let mut rng = rand::rng(); // 获取随机数生成器
+        indices.shuffle(&mut rng); // 随机打乱索引
         // 创建索引张量
         let indices_tensor = Tensor::from_vec(indices, (len,), self.input_ids.device())?;
         // 根据随机索引重新排列输入和目标张量
@@ -103,7 +103,7 @@ impl Dataset for TokenDataset {
 
 // 正弦位置嵌入结构，用于为序列中的位置提供信息
 pub struct SinusoidalPositionEmbedding {
-    pub pos_embedding: Tensor,  // 位置嵌入张量
+    pub pos_embedding: Tensor, // 位置嵌入张量
 }
 
 impl SinusoidalPositionEmbedding {
@@ -113,18 +113,20 @@ impl SinusoidalPositionEmbedding {
     //   hidden_dim: 隐藏层维度（必须为偶数）
     //   device: 计算设备
     pub fn new(seq_len: usize, hidden_dim: usize, device: &Device) -> Result<Self> {
-        assert_eq!(hidden_dim % 2, 0, "hidden_dim must be even");  // 隐藏维度必须为偶数
+        assert_eq!(hidden_dim % 2, 0, "hidden_dim must be even"); // 隐藏维度必须为偶数
 
         let mut pos_embedding_vec = Vec::new();
         // 为每个位置和每个维度计算正弦/余弦值
-        for pos in 0..seq_len {  // 遍历序列中的每个位置
-            for i in (0..hidden_dim).step_by(2) {  // 遍历维度，步长为2（因为成对处理）
+        for pos in 0..seq_len {
+            // 遍历序列中的每个位置
+            for i in (0..hidden_dim).step_by(2) {
+                // 遍历维度，步长为2（因为成对处理）
                 // 计算位置编码公式: pos / (10000^(i/d_model))
                 let pos_i = pos as f32 / 10000.0_f32.powf(i as f32 / hidden_dim as f32);
-                let sin = pos_i.sin();  // 计算正弦值
-                let cos = pos_i.cos();  // 计算余弦值
-                pos_embedding_vec.push(sin);  // 添加正弦值
-                pos_embedding_vec.push(cos);  // 添加余弦值
+                let sin = pos_i.sin(); // 计算正弦值
+                let cos = pos_i.cos(); // 计算余弦值
+                pos_embedding_vec.push(sin); // 添加正弦值
+                pos_embedding_vec.push(cos); // 添加余弦值
             }
         }
 
@@ -139,12 +141,12 @@ impl SinusoidalPositionEmbedding {
 // 这是 RoPE (Rotary Position Embedding) 的核心操作
 // 实现公式: x * cos(θ) + rotate(x) * sin(θ)
 pub fn apply_sin_cos(x: &Tensor, sin: &Tensor, cos: &Tensor) -> Result<Tensor> {
-    let (_, _, _, head_dim) = x.dims4()?;  // 获取最后一个维度（头维度）
-    let half_dim = head_dim / 2;  // 计算一半维度
+    let (_, _, _, head_dim) = x.dims4()?; // 获取最后一个维度（头维度）
+    let half_dim = head_dim / 2; // 计算一半维度
     // 分割张量为两部分
-    let x1 = x.narrow(D::Minus1, 0, half_dim)?;  // 前半部分
-    let x2 = x.narrow(D::Minus1, half_dim, half_dim)?;  // 后半部分
-    let x2 = x2.affine(-1.0, 0.0)?;  // 对后半部分取负
+    let x1 = x.narrow(D::Minus1, 0, half_dim)?; // 前半部分
+    let x2 = x.narrow(D::Minus1, half_dim, half_dim)?; // 后半部分
+    let x2 = x2.affine(-1.0, 0.0)?; // 对后半部分取负
     // 重新排列: 将 -x2 和 x1 连接起来实现旋转
     let rotate_x = Tensor::cat(&[&x2, &x1], D::Minus1)?;
     // 应用 cos 部分
@@ -159,8 +161,8 @@ pub fn apply_sin_cos(x: &Tensor, sin: &Tensor, cos: &Tensor) -> Result<Tensor> {
 // RoPE (Rotary Position Embedding) 结构体
 // 用于实现旋转位置编码，为模型提供位置信息
 pub struct RoPE {
-    sin: Tensor,  // 正弦值张量
-    cos: Tensor,  // 余弦值张量
+    sin: Tensor, // 正弦值张量
+    cos: Tensor, // 余弦值张量
 }
 
 impl RoPE {
@@ -170,13 +172,13 @@ impl RoPE {
     //   embedding_dim: 嵌入维度（必须为偶数）
     //   device: 计算设备
     pub fn new(seq_len: usize, embedding_dim: usize, device: &Device) -> Result<Self> {
-        assert_eq!(embedding_dim % 2, 0, "hidden_dim must be even");  // 嵌入维度必须为偶数
+        assert_eq!(embedding_dim % 2, 0, "hidden_dim must be even"); // 嵌入维度必须为偶数
 
         // 创建位置向量 [0, 1, 2, ..., seq_len-1]
         let pos_vec = (0..seq_len).map(|i| i as f32).collect();
         // 创建角度基础向量
         let angle_base = (0..embedding_dim)
-            .step_by(2)  // 每两个维度计算一次
+            .step_by(2) // 每两个维度计算一次
             .map(|i| 1.0_f32 / 10000.0_f32.powf(i as f32 / embedding_dim as f32))
             .collect();
         // 创建位置张量
@@ -205,8 +207,8 @@ impl RoPE {
     //   x: 输入张量
     //   pos_idx: 起始位置索引
     pub fn apply(&self, x: &Tensor, pos_idx: usize) -> Result<Tensor> {
-        let (_, _, seq_len, _) = x.dims4()?;  // 获取序列长度
-        let (rope_seq_len, _) = self.cos.dims2()?;  // 获取 RoPE 序列长度
+        let (_, _, seq_len, _) = x.dims4()?; // 获取序列长度
+        let (rope_seq_len, _) = self.cos.dims2()?; // 获取 RoPE 序列长度
         // 确保 RoPE 的长度足够覆盖所需位置
         assert!(
             rope_seq_len >= (pos_idx + seq_len),
@@ -222,7 +224,7 @@ impl RoPE {
 
     // 创建新的 RoPE 实例（替代实现）
     pub fn new_reformer(seq_len: usize, embedding_dim: usize, device: &Device) -> Result<Self> {
-        assert_eq!(embedding_dim % 2, 0, "hidden_dim must be even");  // 嵌入维度必须为偶数
+        assert_eq!(embedding_dim % 2, 0, "hidden_dim must be even"); // 嵌入维度必须为偶数
 
         let mut angle = Vec::new();
         // 计算角度值
@@ -235,8 +237,8 @@ impl RoPE {
         }
 
         let angle_tensor = Tensor::from_vec(angle, (seq_len, embedding_dim), device)?;
-        let cos = angle_tensor.cos()?;  // 计算余弦值
-        let sin = angle_tensor.sin()?;  // 计算正弦值
+        let cos = angle_tensor.cos()?; // 计算余弦值
+        let sin = angle_tensor.sin()?; // 计算正弦值
 
         Ok(Self { sin, cos })
     }
@@ -318,16 +320,16 @@ impl RoPE {
 // 点积注意力结构体
 // 实现基本的缩放点积注意力机制
 pub struct DotProductAttention {
-    w_q: Linear,      // 查询线性变换层
-    w_k: Linear,      // 键线性变换层
-    w_v: Linear,      // 值线性变换层
-    d_sqrt: Tensor,   // 缩放因子 (1/sqrt(d_k))，用于缩放注意力分数
+    w_q: Linear,    // 查询线性变换层
+    w_k: Linear,    // 键线性变换层
+    w_v: Linear,    // 值线性变换层
+    d_sqrt: Tensor, // 缩放因子 (1/sqrt(d_k))，用于缩放注意力分数
 }
 
 // 使用掩码填充张量
 // 将掩码位置的值替换为指定值（通常用于掩码未来信息）
 pub fn mask_filled(on_true: &Tensor, mask: &Tensor, on_false: f32) -> Result<Tensor> {
-    let (mask_seq_len, _) = mask.dims2()?;    // 获取掩码序列长度
+    let (mask_seq_len, _) = mask.dims2()?; // 获取掩码序列长度
     let (_, _, seq_len, _) = on_true.dims4()?; // 获取输入张量序列长度
     // 确保掩码长度足够
     assert!(
@@ -391,7 +393,7 @@ impl DotProductAttention {
     //   x: 输入张量
     //   mask: 是否应用掩码（通常用于因果注意力）
     pub fn forward_with_mask(&self, x: &Tensor, mask: bool) -> Result<Tensor> {
-        let (_, seq_len, _) = x.dims3()?;  // 获取序列长度
+        let (_, seq_len, _) = x.dims3()?; // 获取序列长度
         // 线性变换得到 Q, K, V
         let q = self.w_q.forward(x)?;
         let k = self.w_k.forward(x)?;
@@ -421,7 +423,7 @@ impl DotProductAttention {
 // 共享缓冲区结构，用于缓存掩码和 RoPE 计算结果
 // 避免重复计算，提高效率
 pub struct SharedBuffer {
-    buffers: HashMap<String, (Tensor, RoPE)>,  // 缓存映射，键为"序列长度_维度"格式
+    buffers: HashMap<String, (Tensor, RoPE)>, // 缓存映射，键为"序列长度_维度"格式
 }
 
 impl SharedBuffer {
@@ -434,12 +436,12 @@ impl SharedBuffer {
     // 获取指定序列长度和维度的掩码和 RoPE
     // 如果不存在则创建并缓存
     pub fn get(&mut self, seq_len: usize, dim: usize, device: &Device) -> Result<&(Tensor, RoPE)> {
-        let key = format!("{seq_len}_{dim}");  // 创建缓存键
+        let key = format!("{seq_len}_{dim}"); // 创建缓存键
         if !self.buffers.contains_key(&key) {
             // 如果缓存中不存在，则创建新的掩码和 RoPE
-            let mask = Tensor::tril2(seq_len, DType::U32, device)?;  // 创建下三角掩码
-            let rope = RoPE::new(seq_len, dim, device)?;  // 创建 RoPE
-            self.buffers.insert(key.clone(), (mask, rope));  // 存入缓存
+            let mask = Tensor::tril2(seq_len, DType::U32, device)?; // 创建下三角掩码
+            let rope = RoPE::new(seq_len, dim, device)?; // 创建 RoPE
+            self.buffers.insert(key.clone(), (mask, rope)); // 存入缓存
         }
 
         // 获取缓存的值
@@ -512,15 +514,15 @@ impl MultiHeadAttention {
     //   x: 输入张量
     //   mask: 是否应用因果掩码
     pub fn forward(&self, x: &Tensor, mask: bool) -> Result<Tensor> {
-        let (bs, seq_len, _) = x.dims3()?;  // 获取批次大小和序列长度
+        let (bs, seq_len, _) = x.dims3()?; // 获取批次大小和序列长度
 
         // 线性变换并重塑为多头格式 (bs, seq_len, n_head, head_dim)
         let q = self
             .w_q
             .forward(x)?
-            .reshape((bs, seq_len, self.n_head, self.head_dim))?  // 重塑为多头格式
-            .transpose(1, 2)?  // 转置为 (bs, n_head, seq_len, head_dim)
-            .contiguous()?;     // 确保内存连续
+            .reshape((bs, seq_len, self.n_head, self.head_dim))? // 重塑为多头格式
+            .transpose(1, 2)? // 转置为 (bs, n_head, seq_len, head_dim)
+            .contiguous()?; // 确保内存连续
         let k = self
             .w_k
             .forward(x)?
@@ -535,7 +537,7 @@ impl MultiHeadAttention {
             .contiguous()?;
 
         // 计算注意力分数
-        let mut atten_score = q.matmul(&k.t()?)?;  // (bs, n_head, seq_len, seq_len)
+        let mut atten_score = q.matmul(&k.t()?)?; // (bs, n_head, seq_len, seq_len)
 
         if mask {
             // 应用因果掩码（防止看到未来信息）
@@ -553,8 +555,8 @@ impl MultiHeadAttention {
 
         // 重新整形为输出格式
         let atten_weight = atten_weight
-            .transpose(1, 2)?  // 转置回 (bs, seq_len, n_head, head_dim)
-            .reshape((bs, seq_len, self.out_dim))?;  // 合并头维度
+            .transpose(1, 2)? // 转置回 (bs, seq_len, n_head, head_dim)
+            .reshape((bs, seq_len, self.out_dim))?; // 合并头维度
         // 通过输出投影层
         let out = self.out_proj.forward(&atten_weight)?;
         Ok(out)
@@ -565,7 +567,7 @@ impl MultiHeadAttention {
     //   x: 输入张量
     //   mask: 是否应用掩码
     pub fn forward_with_rope(&self, x: &Tensor, mask: bool) -> Result<Tensor> {
-        let (bs, seq_len, _) = x.dims3()?;  // 获取批次大小和序列长度
+        let (bs, seq_len, _) = x.dims3()?; // 获取批次大小和序列长度
 
         // 线性变换并重塑为多头格式
         let q = self
@@ -620,7 +622,7 @@ impl MultiHeadAttention {
     //   x: 输入张量
     //   buffer: 共享缓冲区，提供预计算的掩码和 RoPE
     pub fn forward_with_buffer(&self, x: &Tensor, buffer: &mut SharedBuffer) -> Result<Tensor> {
-        let (bs, seq_len, _) = x.dims3()?;  // 获取批次大小和序列长度
+        let (bs, seq_len, _) = x.dims3()?; // 获取批次大小和序列长度
 
         // 线性变换并重塑为多头格式
         let q = self
@@ -672,16 +674,16 @@ impl MultiHeadAttention {
 // 分组注意力结构体
 // 实现分组查询注意力机制，减少计算复杂度
 pub struct GroupAttention {
-    w_q: Linear,      // 查询线性变换层
-    w_k: Linear,      // 键线性变换层
-    w_v: Linear,      // 值线性变换层
-    out_proj: Linear, // 输出投影层
-    n_head: usize,    // 查询头数
-    n_kv_head: usize, // 键值头数（通常少于查询头数以减少计算）
+    w_q: Linear,       // 查询线性变换层
+    w_k: Linear,       // 键线性变换层
+    w_v: Linear,       // 值线性变换层
+    out_proj: Linear,  // 输出投影层
+    n_head: usize,     // 查询头数
+    n_kv_head: usize,  // 键值头数（通常少于查询头数以减少计算）
     group_size: usize, // 每组的头数 (n_head / n_kv_head)
-    head_dim: usize,  // 每个头的维度
-    out_dim: usize,   // 输出维度
-    d_sqrt: Tensor,   // 缩放因子 (1/sqrt(head_dim))
+    head_dim: usize,   // 每个头的维度
+    out_dim: usize,    // 输出维度
+    d_sqrt: Tensor,    // 缩放因子 (1/sqrt(head_dim))
 }
 
 impl GroupAttention {
@@ -710,14 +712,14 @@ impl GroupAttention {
             "n_head must be divisible by n_kv_head"
         );
 
-        let head_dim = out_dim / n_head;  // 计算每个头的维度
+        let head_dim = out_dim / n_head; // 计算每个头的维度
         // 创建查询、键、值的线性变换层
         let w_q = linear_no_bias(in_dim, out_dim, vb.pp("w_q"))?;
-        let w_k = linear_no_bias(in_dim, n_kv_head * head_dim, vb.pp("w_k"))?;  // 键维度为 n_kv_head * head_dim
-        let w_v = linear_no_bias(in_dim, n_kv_head * head_dim, vb.pp("w_v"))?;  // 值维度为 n_kv_head * head_dim
+        let w_k = linear_no_bias(in_dim, n_kv_head * head_dim, vb.pp("w_k"))?; // 键维度为 n_kv_head * head_dim
+        let w_v = linear_no_bias(in_dim, n_kv_head * head_dim, vb.pp("w_v"))?; // 值维度为 n_kv_head * head_dim
         let out_proj = linear_no_bias(out_dim, out_dim, vb.pp("out_proj"))?;
-        let group_size = n_head / n_kv_head;  // 计算每组的头数
-        let d_sqrt = 1.0 / (head_dim as f32).sqrt();  // 计算缩放因子
+        let group_size = n_head / n_kv_head; // 计算每组的头数
+        let d_sqrt = 1.0 / (head_dim as f32).sqrt(); // 计算缩放因子
         let d_sqrt = Tensor::new(d_sqrt, device)?;
 
         Ok(Self {
@@ -739,7 +741,7 @@ impl GroupAttention {
     //   x: 输入张量
     //   buffer: 共享缓冲区，提供预计算的掩码和 RoPE
     pub fn forward(&self, x: &Tensor, buffer: &mut SharedBuffer) -> Result<Tensor> {
-        let (bs, seq_len, _) = x.dims3()?;  // 获取批次大小和序列长度
+        let (bs, seq_len, _) = x.dims3()?; // 获取批次大小和序列长度
         // 从缓冲区获取掩码和 RoPE
         let (mask, rope) = buffer.get(seq_len, self.head_dim, x.device())?;
 
@@ -748,7 +750,7 @@ impl GroupAttention {
             .w_q
             .forward(x)?
             .reshape((bs, seq_len, self.n_head, self.head_dim))?
-            .transpose(1, 2)?  // 转置为 (bs, n_head, seq_len, head_dim)
+            .transpose(1, 2)? // 转置为 (bs, n_head, seq_len, head_dim)
             .contiguous()?;
         // 键变换: (bs, seq_len, n_kv_head, head_dim) -> (bs, n_kv_head, seq_len, head_dim)
         let k = self
@@ -787,8 +789,8 @@ impl GroupAttention {
 
         // 重新整形为输出格式
         let atten_weight = atten_weight
-            .transpose(1, 2)?  // 转置回 (bs, seq_len, n_head, head_dim)
-            .reshape((bs, seq_len, self.out_dim))?;  // 合并头维度
+            .transpose(1, 2)? // 转置回 (bs, seq_len, n_head, head_dim)
+            .reshape((bs, seq_len, self.out_dim))?; // 合并头维度
         // 通过输出投影层
         let out = self.out_proj.forward(&atten_weight)?;
         Ok(out)
@@ -798,17 +800,17 @@ impl GroupAttention {
 // 带 KV 缓存的分组注意力结构体
 // 用于推理时的增量生成，通过缓存之前的 K 和 V 值来避免重复计算
 pub struct GroupAttentionWithKVCache {
-    w_q: Linear,      // 查询线性变换层
-    w_k: Linear,      // 键线性变换层
-    w_v: Linear,      // 值线性变换层
-    out_proj: Linear, // 输出投影层
-    n_head: usize,    // 查询头数
-    n_kv_head: usize, // 键值头数
-    group_size: usize, // 每组的头数 (n_head / n_kv_head)
-    head_dim: usize,  // 每个头的维度
-    out_dim: usize,   // 输出维度
-    max_context: usize, // 最大上下文长度
-    d_sqrt: Tensor,   // 缩放因子 (1/sqrt(head_dim))
+    w_q: Linear,             // 查询线性变换层
+    w_k: Linear,             // 键线性变换层
+    w_v: Linear,             // 值线性变换层
+    out_proj: Linear,        // 输出投影层
+    n_head: usize,           // 查询头数
+    n_kv_head: usize,        // 键值头数
+    group_size: usize,       // 每组的头数 (n_head / n_kv_head)
+    head_dim: usize,         // 每个头的维度
+    out_dim: usize,          // 输出维度
+    max_context: usize,      // 最大上下文长度
+    d_sqrt: Tensor,          // 缩放因子 (1/sqrt(head_dim))
     cache_k: Option<Tensor>, // K 缓存（可选）
     cache_v: Option<Tensor>, // V 缓存（可选）
 }
@@ -840,14 +842,14 @@ impl GroupAttentionWithKVCache {
             "n_head must be divisible by n_kv_head"
         );
 
-        let head_dim = out_dim / n_head;  // 计算每个头的维度
+        let head_dim = out_dim / n_head; // 计算每个头的维度
         // 创建线性变换层
         let w_q = linear_no_bias(in_dim, out_dim, vb.pp("w_q"))?;
         let w_k = linear_no_bias(in_dim, n_kv_head * head_dim, vb.pp("w_k"))?;
         let w_v = linear_no_bias(in_dim, n_kv_head * head_dim, vb.pp("w_v"))?;
         let out_proj = linear_no_bias(out_dim, out_dim, vb.pp("out_proj"))?;
-        let group_size = n_head / n_kv_head;  // 计算组大小
-        let d_sqrt = 1.0 / (head_dim as f32).sqrt();  // 计算缩放因子
+        let group_size = n_head / n_kv_head; // 计算组大小
+        let d_sqrt = 1.0 / (head_dim as f32).sqrt(); // 计算缩放因子
         let d_sqrt = Tensor::new(d_sqrt, device)?;
 
         Ok(Self {
@@ -857,13 +859,13 @@ impl GroupAttentionWithKVCache {
             out_proj,
             n_head,
             n_kv_head,
-            max_context,  // 最大上下文长度
+            max_context, // 最大上下文长度
             group_size,
             head_dim,
             out_dim,
             d_sqrt,
-            cache_k: None,  // 初始化 K 缓存为 None
-            cache_v: None,  // 初始化 V 缓存为 None
+            cache_k: None, // 初始化 K 缓存为 None
+            cache_v: None, // 初始化 V 缓存为 None
         })
     }
 
@@ -880,7 +882,7 @@ impl GroupAttentionWithKVCache {
         use_cache: bool,
         pos_idx: usize,
     ) -> Result<Tensor> {
-        let (bs, seq_len, _) = x.dims3()?;  // 获取批次大小和序列长度
+        let (bs, seq_len, _) = x.dims3()?; // 获取批次大小和序列长度
         // 从缓冲区获取掩码和 RoPE（使用最大上下文长度）
         let (mask, rope) = buffer.get(self.max_context, self.head_dim, x.device())?;
 
@@ -889,7 +891,7 @@ impl GroupAttentionWithKVCache {
             .w_q
             .forward(x)?
             .reshape((bs, seq_len, self.n_head, self.head_dim))?
-            .transpose(1, 2)?  // 转置为 (bs, n_head, seq_len, head_dim)
+            .transpose(1, 2)? // 转置为 (bs, n_head, seq_len, head_dim)
             .contiguous()?;
         // 键变换: (bs, seq_len, n_kv_head, head_dim) -> (bs, n_kv_head, seq_len, head_dim)
         let mut k = self
@@ -908,9 +910,9 @@ impl GroupAttentionWithKVCache {
 
         if use_cache {
             // 使用缓存模式：应用 RoPE 到指定位置
-            q = rope.apply(&q, pos_idx)?;  // 应用 RoPE 到指定位置范围
-            k = rope.apply(&k, pos_idx)?;  // 应用 RoPE 到指定位置范围
-            v = rope.apply(&v, pos_idx)?;  // 应用 RoPE 到指定位置范围（已修复：之前遗漏了v）
+            q = rope.apply(&q, pos_idx)?; // 应用 RoPE 到指定位置范围
+            k = rope.apply(&k, pos_idx)?; // 应用 RoPE 到指定位置范围
+            v = rope.apply(&v, pos_idx)?; // 应用 RoPE 到指定位置范围（已修复：之前遗漏了v）
 
             // 管理 KV 缓存
             if self.cache_k.is_none() {
@@ -920,24 +922,24 @@ impl GroupAttentionWithKVCache {
             } else {
                 // 如果已有缓存，将当前 K/V 与缓存连接
                 if let Some(cache_k_) = &self.cache_k {
-                    k = Tensor::cat(&[cache_k_, &k], D::Minus2)?;  // 沿着序列维度连接
+                    k = Tensor::cat(&[cache_k_, &k], D::Minus2)?; // 沿着序列维度连接
                     self.cache_k = Some(k.clone());
                 }
                 if let Some(cache_v_) = &self.cache_v {
-                    v = Tensor::cat(&[cache_v_, &v], D::Minus2)?;  // 沿着序列维度连接
+                    v = Tensor::cat(&[cache_v_, &v], D::Minus2)?; // 沿着序列维度连接
                     self.cache_v = Some(v.clone());
                 }
             }
         } else {
             // 非缓存模式：应用 RoPE 到完整序列
-            q = rope.forward(&q)?;  // 应用 RoPE 到完整序列
-            k = rope.forward(&k)?;  // 应用 RoPE 到完整序列
-            v = rope.forward(&v)?;  // 应用 RoPE 到完整序列
+            q = rope.forward(&q)?; // 应用 RoPE 到完整序列
+            k = rope.forward(&k)?; // 应用 RoPE 到完整序列
+            v = rope.forward(&v)?; // 应用 RoPE 到完整序列
         }
 
         // 重复 K 和 V 张量以匹配查询头数
-        let k = k.repeat((1, self.group_size, 1, 1))?;  // 重复 K
-        let v = v.repeat((1, self.group_size, 1, 1))?;  // 重复 V
+        let k = k.repeat((1, self.group_size, 1, 1))?; // 重复 K
+        let v = v.repeat((1, self.group_size, 1, 1))?; // 重复 V
 
         // 计算注意力分数
         let mut atten_score = q.matmul(&k.t()?)?;
@@ -954,11 +956,35 @@ impl GroupAttentionWithKVCache {
 
         // 重新整形为输出格式
         let atten_weight = atten_weight
-            .transpose(1, 2)?  // 转置回 (bs, seq_len, n_head, head_dim)
-            .reshape((bs, seq_len, self.out_dim))?;  // 合并头维度
+            .transpose(1, 2)? // 转置回 (bs, seq_len, n_head, head_dim)
+            .reshape((bs, seq_len, self.out_dim))?; // 合并头维度
         // 通过输出投影层
         let out = self.out_proj.forward(&atten_weight)?;
         Ok(out)
+    }
+}
+
+pub struct RMSNorm {
+    weight: Tensor,
+    eps: Tensor,
+}
+
+impl RMSNorm {
+    pub fn new(vb: VarBuilder, eps: f32, head_dim: usize) -> Result<Self> {
+        let weight = vb.get_with_hints(head_dim, "weight", Init::Const(1.0))?;
+        let eps = Tensor::new(eps, vb.device())?;
+        Ok(Self { weight, eps })
+    }
+
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let mean = x.powf(2.0)?.mean(D::Minus1)?;
+        let rms = mean
+            .broadcast_add(&self.eps)?
+            .sqrt()?
+            .unsqueeze(D::Minus1)?;
+        let x_norm = x.broadcast_div(&rms)?;
+        let x_norm = x_norm.broadcast_mul(&self.weight)?;
+        Ok(x_norm)
     }
 }
 
@@ -971,68 +997,72 @@ fn main() -> Result<()> {
     let text = read_text("src/assets/sub_wiki_0_99.txt");
     let tokenizer = Tokenizer::from_file("src/assets/tokenizer.json")
         .map_err(|e| Error::Msg(format!("tokenizer from file error {}", e)))?;
-    let vocab_size = tokenizer.get_vocab_size(true);  // 获取词汇表大小
+    let vocab_size = tokenizer.get_vocab_size(true); // 获取词汇表大小
 
     // 设置数据处理参数
-    let seq_len = 32;      // 序列长度
-    let stride = 32;       // 滑动窗口步长
-    let batch_size = 2;    // 批次大小
+    let seq_len = 32; // 序列长度
+    let stride = 32; // 滑动窗口步长
+    let batch_size = 2; // 批次大小
 
     // 创建数据集和数据加载器
     let token_dataset = TokenDataset::new(text, &tokenizer, seq_len, stride, &device)?;
-    let mut dataloader = DataLoader::new(token_dataset, batch_size, true)?;  // 启用随机打乱
-    let _ = dataloader.reset()?;  // 重置数据加载器
-    let (x, _y) = dataloader.next().unwrap()?;  // 获取第一个批次的数据
+    let mut dataloader = DataLoader::new(token_dataset, batch_size, true)?; // 启用随机打乱
+    let _ = dataloader.reset()?; // 重置数据加载器
+    let (x, _y) = dataloader.next().unwrap()?; // 获取第一个批次的数据
 
     // 设置模型参数
-    let embedding_dim = 32;  // 嵌入维度
-    let varmap = VarMap::new();  // 创建变量映射
-    let vb = VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &device);  // 创建变量构建器
+    let embedding_dim = 32; // 嵌入维度
+    let varmap = VarMap::new(); // 创建变量映射
+    let vb = VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &device); // 创建变量构建器
     // 创建嵌入层
     let embedding = embedding(vocab_size, embedding_dim, vb.pp("embedding"))?;
     // 将输入 token 转换为嵌入向量
     let encode = embedding.forward(&x)?;
 
+    // RMS Norm
+    let rms_norm = RMSNorm::new(vb.pp("rms_norm"), 1e-5, embedding_dim)?;
+    let encode = rms_norm.forward(&encode)?;
+
     // 设置注意力参数
-    let n_head = 4;      // 查询头数
-    let n_kv_head = 2;   // 键值头数
-    let mut buffer = SharedBuffer::new()?;  // 创建共享缓冲区
+    let n_head = 4; // 查询头数
+    let n_kv_head = 2; // 键值头数
+    let mut buffer = SharedBuffer::new()?; // 创建共享缓冲区
 
     // 创建带 KV 缓存的分组注意力层
     let mut attention = GroupAttentionWithKVCache::new(
-        vb.pp("self_attn"),  // 变量构建器路径
-        embedding_dim,       // 输入维度
-        embedding_dim,       // 输出维度
-        n_head,              // 查询头数
-        n_kv_head,           // 键值头数
-        seq_len,             // 最大上下文长度
-        &device,             // 计算设备
+        vb.pp("self_attn"), // 变量构建器路径
+        embedding_dim,      // 输入维度
+        embedding_dim,      // 输出维度
+        n_head,             // 查询头数
+        n_kv_head,          // 键值头数
+        seq_len,            // 最大上下文长度
+        &device,            // 计算设备
     )?;
 
     // 第一次前向传播：不使用缓存
     let output = attention.forward(&encode, &mut buffer, false, 0)?;
     println!("output:{:?}", output);
 
-    // 第二次前向传播：使用缓存处理中文文本
-    let encode = tokenizer
-        .encode("你好，你好可爱啊", true)  // 对中文文本进行编码
-        .map_err(|e| Error::Msg(format!("tokenizer failed: {}", e)))?;
-    let token_ids = encode.get_ids();  // 获取 token ID
-    let token_tensor = Tensor::new(token_ids, &device)?;  // 创建 token 张量
-    let token_tensor = token_tensor.unsqueeze(0)?;  // 添加批次维度
-    let encode = embedding.forward(&token_tensor)?;  // 获取嵌入
-    // 使用缓存进行前向传播
-    let output = attention.forward(&encode, &mut buffer, true, 0)?;
-    println!("output:{:?}", output);
+    // // 第二次前向传播：使用缓存处理中文文本
+    // let encode = tokenizer
+    //     .encode("你好，你好可爱啊", true) // 对中文文本进行编码
+    //     .map_err(|e| Error::Msg(format!("tokenizer failed: {}", e)))?;
+    // let token_ids = encode.get_ids(); // 获取 token ID
+    // let token_tensor = Tensor::new(token_ids, &device)?; // 创建 token 张量
+    // let token_tensor = token_tensor.unsqueeze(0)?; // 添加批次维度
+    // let encode = embedding.forward(&token_tensor)?; // 获取嵌入
+    // // 使用缓存进行前向传播
+    // let output = attention.forward(&encode, &mut buffer, true, 0)?;
+    // println!("output:{:?}", output);
 
-    // 第三次前向传播：继续使用缓存生成下一个 token
-    let pos_idx = token_ids.len();  // 获取当前位置索引
-    let token_tensor = Tensor::new(3589 as u32, &device)?;  // 创建单个 token 张量
-    let token_tensor = token_tensor.unsqueeze(0)?.unsqueeze(0)?;  // 调整形状为 [1, 1, 1]
-    let encode = embedding.forward(&token_tensor)?;  // 获取嵌入
-    // 在指定位置索引处进行前向传播
-    let output = attention.forward(&encode, &mut buffer, true, pos_idx)?;
-    println!("output:{:?}", output);
+    // // 第三次前向传播：继续使用缓存生成下一个 token
+    // let pos_idx = token_ids.len(); // 获取当前位置索引
+    // let token_tensor = Tensor::new(3589 as u32, &device)?; // 创建单个 token 张量
+    // let token_tensor = token_tensor.unsqueeze(0)?.unsqueeze(0)?; // 调整形状为 [1, 1, 1]
+    // let encode = embedding.forward(&token_tensor)?; // 获取嵌入
+    // // 在指定位置索引处进行前向传播
+    // let output = attention.forward(&encode, &mut buffer, true, pos_idx)?;
+    // println!("output:{:?}", output);
 
     Ok(())
 }
