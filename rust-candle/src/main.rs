@@ -2,11 +2,13 @@ use core::f32;
 use std::collections::HashMap;
 
 use candle_core::{D, DType, Device, Error, IndexOp, Result, Tensor};
-use candle_nn::{Init, Linear, Module, VarBuilder, VarMap, embedding, linear_no_bias, ops};
+use candle_nn::{
+    Embedding, Init, Linear, Module, VarBuilder, VarMap, embedding, linear_no_bias, ops,
+};
 use rand::seq::SliceRandom;
 use tokenizers::Tokenizer;
 
-use crate::utils::{DataLoader, Dataset, file::read_text};
+use crate::utils::{DataLoader, Dataset, file::read_text, net::print_varmap};
 
 mod chapter2;
 mod chapter3;
@@ -878,13 +880,13 @@ impl GroupAttentionWithKVCache {
     pub fn forward(
         &mut self,
         x: &Tensor,
-        buffer: &mut SharedBuffer,
+        buffers: &mut SharedBuffer,
         use_cache: bool,
         pos_idx: usize,
     ) -> Result<Tensor> {
         let (bs, seq_len, _) = x.dims3()?; // 获取批次大小和序列长度
         // 从缓冲区获取掩码和 RoPE（使用最大上下文长度）
-        let (mask, rope) = buffer.get(self.max_context, self.head_dim, x.device())?;
+        let (mask, rope) = buffers.get(self.max_context, self.head_dim, x.device())?;
 
         // 查询变换: (bs, seq_len, n_head, head_dim) -> (bs, n_head, seq_len, head_dim)
         let mut q = self
@@ -970,8 +972,8 @@ pub struct RMSNorm {
 }
 
 impl RMSNorm {
-    pub fn new(vb: VarBuilder, eps: f32, head_dim: usize) -> Result<Self> {
-        let weight = vb.get_with_hints(head_dim, "weight", Init::Const(1.0))?;
+    pub fn new(vb: VarBuilder, eps: f32, dim: usize) -> Result<Self> {
+        let weight = vb.get_with_hints(dim, "weight", Init::Const(1.0))?;
         let eps = Tensor::new(eps, vb.device())?;
         Ok(Self { weight, eps })
     }
@@ -988,6 +990,153 @@ impl RMSNorm {
     }
 }
 
+pub struct FeedForward {
+    up: Linear,
+    gate: Linear,
+    down: Linear,
+}
+
+impl FeedForward {
+    pub fn new(vb: VarBuilder, in_dim: usize, hidden_dim: usize, out_dim: usize) -> Result<Self> {
+        let up = linear_no_bias(in_dim, hidden_dim, vb.pp("up"))?;
+        let gate = linear_no_bias(in_dim, hidden_dim, vb.pp("gate"))?;
+        let down = linear_no_bias(hidden_dim, out_dim, vb.pp("down"))?;
+
+        Ok(Self { up, gate, down })
+    }
+
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let up_x = self.up.forward(x)?;
+        let gate_x = self.gate.forward(x)?.silu()?;
+        let mul_cat = up_x.mul(&gate_x)?;
+        let down = self.down.forward(&mul_cat)?;
+        Ok(down)
+    }
+}
+
+pub struct LLMConfig {
+    vocab_size: usize,
+    embedding_dim: usize,
+    n_block: usize,
+    n_head: usize,
+    n_kv_head: usize,
+    max_context: usize,
+    hidden_dim: usize,
+    eps: f32,
+}
+
+impl LLMConfig {
+    pub fn default() -> Result<LLMConfig> {
+        Ok(Self {
+            vocab_size: 151669,
+            embedding_dim: 512,
+            n_block: 8,
+            n_head: 8,
+            n_kv_head: 4,
+            max_context: 512,
+            hidden_dim: 1024,
+            eps: 1e-6,
+        })
+    }
+}
+
+pub struct AttentionBlock {
+    rms_norm1: RMSNorm,
+    attention: GroupAttentionWithKVCache,
+    rms_norm2: RMSNorm,
+    feed_forward: FeedForward,
+}
+
+impl AttentionBlock {
+    pub fn new(vb: VarBuilder, config: &LLMConfig) -> Result<Self> {
+        let rms_norm1 = RMSNorm::new(vb.pp("rms_norm1"), config.eps, config.embedding_dim)?;
+        let attention = GroupAttentionWithKVCache::new(
+            vb.pp("attention"),
+            config.embedding_dim,
+            config.embedding_dim,
+            config.n_head,
+            config.n_kv_head,
+            config.max_context,
+            vb.device(),
+        )?;
+        let rms_norm2 = RMSNorm::new(vb.pp("rms_norm2"), config.eps, config.embedding_dim)?;
+        let feed_forward = FeedForward::new(
+            vb.pp("feed_forward"),
+            config.embedding_dim,
+            config.hidden_dim,
+            config.embedding_dim,
+        )?;
+
+        Ok(Self {
+            rms_norm1,
+            attention,
+            rms_norm2,
+            feed_forward,
+        })
+    }
+
+    pub fn forward(
+        &mut self,
+        x: &Tensor,
+        buffers: &mut SharedBuffer,
+        use_cache: bool,
+        pos_idx: usize,
+    ) -> Result<Tensor> {
+        let x_norm1 = self.rms_norm1.forward(x)?;
+        let x_atten = self
+            .attention
+            .forward(&x_norm1, buffers, use_cache, pos_idx)?;
+        let shortcut = x.add(&x_atten)?;
+        let x_norm2 = self.rms_norm2.forward(&shortcut)?;
+        let x_feed = self.feed_forward.forward(&x_norm2)?;
+        let shortcut = shortcut.add(&x_feed)?;
+        Ok(shortcut)
+    }
+}
+
+pub struct LLM {
+    embedding: Embedding,
+    attention_blocks: Vec<AttentionBlock>,
+    final_rms: RMSNorm,
+    out_proj: Linear,
+}
+
+impl LLM {
+    pub fn new(vb: VarBuilder, config: &LLMConfig) -> Result<Self> {
+        let embedding = embedding(config.vocab_size, config.embedding_dim, vb.pp("embedding"))?;
+        let mut attention_blocks = Vec::new();
+        for i in 0..config.n_block {
+            let block = AttentionBlock::new(vb.pp(format!("block_{i}")), config)?;
+            attention_blocks.push(block);
+        }
+        let final_rms = RMSNorm::new(vb.pp("final_rms"), config.eps, config.embedding_dim)?;
+        let out_proj = linear_no_bias(config.embedding_dim, config.vocab_size, vb.pp("out_proj"))?;
+
+        Ok(Self {
+            embedding,
+            attention_blocks,
+            final_rms,
+            out_proj,
+        })
+    }
+
+    pub fn forward(
+        &mut self,
+        x: &Tensor,
+        buffers: &mut SharedBuffer,
+        use_cache: bool,
+        pos_idx: usize,
+    ) -> Result<Tensor> {
+        let mut x = self.embedding.forward(x)?;
+        for block in &mut self.attention_blocks {
+            x = block.forward(&x, buffers, use_cache, pos_idx)?;
+        }
+        let x = self.final_rms.forward(&x)?;
+        let x = self.out_proj.forward(&x)?;
+        Ok(x)
+    }
+}
+
 // 主函数：演示模型的使用流程
 fn main() -> Result<()> {
     // 初始化设备（优先使用 Metal，否则使用 CPU）
@@ -997,72 +1146,30 @@ fn main() -> Result<()> {
     let text = read_text("src/assets/sub_wiki_0_99.txt");
     let tokenizer = Tokenizer::from_file("src/assets/tokenizer.json")
         .map_err(|e| Error::Msg(format!("tokenizer from file error {}", e)))?;
-    let vocab_size = tokenizer.get_vocab_size(true); // 获取词汇表大小
 
     // 设置数据处理参数
-    let seq_len = 32; // 序列长度
-    let stride = 32; // 滑动窗口步长
     let batch_size = 2; // 批次大小
+    let config = LLMConfig::default()?;
 
     // 创建数据集和数据加载器
-    let token_dataset = TokenDataset::new(text, &tokenizer, seq_len, stride, &device)?;
+    let token_dataset = TokenDataset::new(
+        text,
+        &tokenizer,
+        config.max_context,
+        config.max_context,
+        &device,
+    )?;
     let mut dataloader = DataLoader::new(token_dataset, batch_size, true)?; // 启用随机打乱
     let _ = dataloader.reset()?; // 重置数据加载器
     let (x, _y) = dataloader.next().unwrap()?; // 获取第一个批次的数据
 
     // 设置模型参数
-    let embedding_dim = 32; // 嵌入维度
     let varmap = VarMap::new(); // 创建变量映射
     let vb = VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &device); // 创建变量构建器
-    // 创建嵌入层
-    let embedding = embedding(vocab_size, embedding_dim, vb.pp("embedding"))?;
-    // 将输入 token 转换为嵌入向量
-    let encode = embedding.forward(&x)?;
-
-    // RMS Norm
-    let rms_norm = RMSNorm::new(vb.pp("rms_norm"), 1e-5, embedding_dim)?;
-    let encode = rms_norm.forward(&encode)?;
-
-    // 设置注意力参数
-    let n_head = 4; // 查询头数
-    let n_kv_head = 2; // 键值头数
-    let mut buffer = SharedBuffer::new()?; // 创建共享缓冲区
-
-    // 创建带 KV 缓存的分组注意力层
-    let mut attention = GroupAttentionWithKVCache::new(
-        vb.pp("self_attn"), // 变量构建器路径
-        embedding_dim,      // 输入维度
-        embedding_dim,      // 输出维度
-        n_head,             // 查询头数
-        n_kv_head,          // 键值头数
-        seq_len,            // 最大上下文长度
-        &device,            // 计算设备
-    )?;
-
-    // 第一次前向传播：不使用缓存
-    let output = attention.forward(&encode, &mut buffer, false, 0)?;
-    println!("output:{:?}", output);
-
-    // // 第二次前向传播：使用缓存处理中文文本
-    // let encode = tokenizer
-    //     .encode("你好，你好可爱啊", true) // 对中文文本进行编码
-    //     .map_err(|e| Error::Msg(format!("tokenizer failed: {}", e)))?;
-    // let token_ids = encode.get_ids(); // 获取 token ID
-    // let token_tensor = Tensor::new(token_ids, &device)?; // 创建 token 张量
-    // let token_tensor = token_tensor.unsqueeze(0)?; // 添加批次维度
-    // let encode = embedding.forward(&token_tensor)?; // 获取嵌入
-    // // 使用缓存进行前向传播
-    // let output = attention.forward(&encode, &mut buffer, true, 0)?;
-    // println!("output:{:?}", output);
-
-    // // 第三次前向传播：继续使用缓存生成下一个 token
-    // let pos_idx = token_ids.len(); // 获取当前位置索引
-    // let token_tensor = Tensor::new(3589 as u32, &device)?; // 创建单个 token 张量
-    // let token_tensor = token_tensor.unsqueeze(0)?.unsqueeze(0)?; // 调整形状为 [1, 1, 1]
-    // let encode = embedding.forward(&token_tensor)?; // 获取嵌入
-    // // 在指定位置索引处进行前向传播
-    // let output = attention.forward(&encode, &mut buffer, true, pos_idx)?;
-    // println!("output:{:?}", output);
-
+    let mut buffers = SharedBuffer::new()?;
+    let mut llm = LLM::new(vb, &config)?;
+    let _ = print_varmap(&varmap)?;
+    let output = llm.forward(&x, &mut buffers, false, 0)?;
+    println!("output: {:?}", output);
     Ok(())
 }
