@@ -8,7 +8,7 @@ use candle_nn::{
 use rand::seq::SliceRandom;
 use tokenizers::Tokenizer;
 
-use crate::utils::{DataLoader, Dataset, file::read_text, net::print_varmap};
+use crate::utils::{DataLoader, Dataset, file::read_text};
 
 mod chapter2;
 mod chapter3;
@@ -964,6 +964,11 @@ impl GroupAttentionWithKVCache {
         let out = self.out_proj.forward(&atten_weight)?;
         Ok(out)
     }
+
+    pub fn reset_kv_cache(&mut self) {
+        self.cache_k = None;
+        self.cache_v = None;
+    }
 }
 
 pub struct RMSNorm {
@@ -1092,6 +1097,10 @@ impl AttentionBlock {
         let shortcut = shortcut.add(&x_feed)?;
         Ok(shortcut)
     }
+
+    pub fn reset_kv_cache(&mut self) {
+        self.attention.reset_kv_cache();
+    }
 }
 
 pub struct LLM {
@@ -1135,6 +1144,74 @@ impl LLM {
         let x = self.out_proj.forward(&x)?;
         Ok(x)
     }
+
+    pub fn reset_kv_cache(&mut self) {
+        for block in &mut self.attention_blocks {
+            block.reset_kv_cache();
+        }
+    }
+}
+
+pub fn encode_str(str: &str, tokenizer: &Tokenizer, device: &Device) -> Result<Tensor> {
+    let encode = tokenizer
+        .encode(str, true)
+        .map_err(|e| Error::Msg(format!("tokenizer encode error:{}", e)))?;
+    let token_ids = encode.get_ids();
+    let len = token_ids.len();
+    let tensor = Tensor::from_slice(token_ids, (1, len), device)?;
+    Ok(tensor)
+}
+
+pub fn decode_tokens(token_ids: &Tensor, tokenizer: &Tokenizer) -> Result<String> {
+    let token_ids_vec = match token_ids.rank() {
+        1 => token_ids.to_vec1()?,
+        2 => token_ids.squeeze(0)?.to_vec1()?,
+        _ => {
+            return Err(Error::Msg(format!(
+                "can't active this rank {} Tensor",
+                token_ids.rank()
+            )));
+        }
+    };
+
+    let decode = tokenizer
+        .decode(&token_ids_vec, true)
+        .map_err(|e| Error::Msg(format!("tokens decode error:{}", e)))?;
+    Ok(decode)
+}
+
+pub fn generate_simple(
+    model: &mut LLM,
+    buffers: &mut SharedBuffer,
+    idx: &Tensor,
+    max_generate: usize,
+    max_context: usize,
+) -> Result<Tensor> {
+    model.reset_kv_cache();
+    let mut idx = idx.clone();
+    let (_, num_tokens) = idx.dims2()?;
+    if num_tokens > max_context {
+        let start = num_tokens - max_context;
+        idx = idx.i((.., start..num_tokens))?;
+    }
+    let mut pos_idx = 0;
+    let mut logits = model.forward(&idx, buffers, true, pos_idx)?;
+    for _ in 0..max_generate {
+        let (_, n_token, _) = logits.dims3()?;
+        pos_idx += n_token;
+        if pos_idx > max_context {
+            pos_idx = 0;
+        }
+        logits = logits.i((.., n_token - 1, ..))?;
+        let probs = ops::softmax(&logits, D::Minus1)?;
+        let mut idx_next = probs.argmax(D::Minus1)?;
+        if idx_next.rank() == 1 {
+            idx_next = idx_next.unsqueeze(0)?;
+        }
+        idx = Tensor::cat(&[&idx, &idx_next], D::Minus1)?;
+        logits = model.forward(&idx_next, buffers, true, pos_idx)?;
+    }
+    Ok(idx)
 }
 
 // 主函数：演示模型的使用流程
@@ -1163,13 +1240,23 @@ fn main() -> Result<()> {
     let _ = dataloader.reset()?; // 重置数据加载器
     let (x, _y) = dataloader.next().unwrap()?; // 获取第一个批次的数据
 
-    // 设置模型参数
     let varmap = VarMap::new(); // 创建变量映射
     let vb = VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &device); // 创建变量构建器
     let mut buffers = SharedBuffer::new()?;
     let mut llm = LLM::new(vb, &config)?;
-    let _ = print_varmap(&varmap)?;
-    let output = llm.forward(&x, &mut buffers, false, 0)?;
-    println!("output: {:?}", output);
+    // let _ = print_varmap(&varmap)?;
+    // let output = llm.forward(&x, &mut buffers, false, 0)?;
+    // println!("output: {:?}", output);
+    let token_tensor = encode_str("吃饭了吗", &tokenizer, &device)?;
+    let generate_token = generate_simple(
+        &mut llm,
+        &mut buffers,
+        &token_tensor,
+        100,
+        config.max_context,
+    )?;
+    let str = decode_tokens(&generate_token, &tokenizer)?;
+    println!("{}", str);
+
     Ok(())
 }
