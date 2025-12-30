@@ -3,7 +3,8 @@ use std::collections::HashMap;
 
 use candle_core::{D, DType, Device, Error, IndexOp, Result, Tensor};
 use candle_nn::{
-    Embedding, Init, Linear, Module, VarBuilder, VarMap, embedding, linear_no_bias, ops,
+    AdamW, Embedding, Init, Linear, Module, Optimizer, VarBuilder, VarMap, embedding,
+    linear_no_bias, loss, ops,
 };
 use rand::seq::SliceRandom;
 use tokenizers::Tokenizer;
@@ -1108,6 +1109,7 @@ pub struct LLM {
     attention_blocks: Vec<AttentionBlock>,
     final_rms: RMSNorm,
     out_proj: Linear,
+    buffers: SharedBuffer,
 }
 
 impl LLM {
@@ -1120,25 +1122,21 @@ impl LLM {
         }
         let final_rms = RMSNorm::new(vb.pp("final_rms"), config.eps, config.embedding_dim)?;
         let out_proj = linear_no_bias(config.embedding_dim, config.vocab_size, vb.pp("out_proj"))?;
+        let buffers = SharedBuffer::new()?;
 
         Ok(Self {
             embedding,
             attention_blocks,
             final_rms,
             out_proj,
+            buffers,
         })
     }
 
-    pub fn forward(
-        &mut self,
-        x: &Tensor,
-        buffers: &mut SharedBuffer,
-        use_cache: bool,
-        pos_idx: usize,
-    ) -> Result<Tensor> {
+    pub fn forward(&mut self, x: &Tensor, use_cache: bool, pos_idx: usize) -> Result<Tensor> {
         let mut x = self.embedding.forward(x)?;
         for block in &mut self.attention_blocks {
-            x = block.forward(&x, buffers, use_cache, pos_idx)?;
+            x = block.forward(&x, &mut self.buffers, use_cache, pos_idx)?;
         }
         let x = self.final_rms.forward(&x)?;
         let x = self.out_proj.forward(&x)?;
@@ -1182,7 +1180,6 @@ pub fn decode_tokens(token_ids: &Tensor, tokenizer: &Tokenizer) -> Result<String
 
 pub fn generate_simple(
     model: &mut LLM,
-    buffers: &mut SharedBuffer,
     idx: &Tensor,
     max_generate: usize,
     max_context: usize,
@@ -1195,7 +1192,7 @@ pub fn generate_simple(
         idx = idx.i((.., start..num_tokens))?;
     }
     let mut pos_idx = 0;
-    let mut logits = model.forward(&idx, buffers, true, pos_idx)?;
+    let mut logits = model.forward(&idx, true, pos_idx)?;
     for _ in 0..max_generate {
         let (_, n_token, _) = logits.dims3()?;
         pos_idx += n_token;
@@ -1209,18 +1206,109 @@ pub fn generate_simple(
             idx_next = idx_next.unsqueeze(0)?;
         }
         idx = Tensor::cat(&[&idx, &idx_next], D::Minus1)?;
-        logits = model.forward(&idx_next, buffers, true, pos_idx)?;
+        logits = model.forward(&idx_next, true, pos_idx)?;
     }
+    model.reset_kv_cache();
     Ok(idx)
+}
+
+pub fn generate_print_text(
+    model: &mut LLM,
+    tokenizer: &Tokenizer,
+    start_context: &str,
+    max_generate: usize,
+    max_context: usize,
+    device: &Device,
+) -> Result<()> {
+    let encode = encode_str(start_context, tokenizer, device)?;
+    let generate_tokens = generate_simple(model, &encode, max_generate, max_context)?;
+    let str = decode_tokens(&generate_tokens, tokenizer)?;
+    println!("generate:\n{:?}", str);
+    Ok(())
+}
+
+pub fn get_batch_loss(model: &mut LLM, x: &Tensor, y: &Tensor) -> Result<Tensor> {
+    let logits = model.forward(x, false, 0)?;
+    let loss_ = loss::cross_entropy(&logits.flatten(0, 1)?, &y.flatten_all()?)?;
+    Ok(loss_)
+}
+
+pub fn get_loader_loss(model: &mut LLM, dataloader: &mut DataLoader) -> Result<f32> {
+    let mut loss_sum = 0.0;
+    let mut count = 0;
+    for batch in dataloader {
+        let (x, y) = batch?;
+        let loss_ = get_batch_loss(model, &x, &y)?;
+        loss_sum += loss_.to_scalar::<f32>()?;
+        count += 1;
+    }
+
+    let loss_ = loss_sum / count as f32;
+    Ok(loss_)
+}
+
+pub fn train_model(
+    model: &mut LLM,
+    train_loader: &mut DataLoader,
+    val_loader: &mut DataLoader,
+    optimizer: &mut AdamW,
+    tokenizer: &Tokenizer,
+    epochs: usize,
+    eval_step: usize,
+    start_context: &str,
+    max_generate: usize,
+    max_context: usize,
+    device: &Device,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    let mut train_loss_vec = Vec::new();
+    let mut val_loss_vec = Vec::new();
+    let mut global_step = 0;
+    for epoch in 0..epochs {
+        let _ = train_loader.reset()?;
+        for batch in &mut *train_loader {
+            let (x, y) = batch?;
+            let loss_ = get_batch_loss(model, &x, &y)?;
+            let _ = optimizer.backward_step(&loss_)?;
+            global_step += 1;
+            if global_step & eval_step == 0 {
+                let _ = val_loader.reset()?;
+                let train_loss = loss_.to_scalar::<f32>()?;
+                let val_loss = get_loader_loss(model, val_loader)?;
+                println!(
+                    "global_step: {} train_loss: {} val_loss: {}",
+                    global_step, train_loss, val_loss
+                );
+                train_loss_vec.push(train_loss);
+                val_loss_vec.push(val_loss);
+                let _ = generate_print_text(
+                    model,
+                    tokenizer,
+                    start_context,
+                    max_generate,
+                    max_context,
+                    device,
+                )?;
+            }
+        }
+        let _ = train_loader.reset()?;
+        let _ = val_loader.reset()?;
+        let train_loss = get_loader_loss(model, train_loader)?;
+        let val_loss = get_loader_loss(model, val_loader)?;
+        println!(
+            "epoch: {} train_loss: {} val_loss: {}",
+            epoch, train_loss, val_loss
+        );
+        train_loss_vec.push(train_loss);
+        val_loss_vec.push(val_loss);
+    }
+
+    Ok((train_loss_vec, val_loss_vec))
 }
 
 // 主函数：演示模型的使用流程
 fn main() -> Result<()> {
     // 初始化设备（优先使用 Metal，否则使用 CPU）
     let device = Device::metal_if_available(0)?;
-
-    // 加载文本数据和分词器
-    let text = read_text("src/assets/sub_wiki_0_99.txt");
     let tokenizer = Tokenizer::from_file("src/assets/tokenizer.json")
         .map_err(|e| Error::Msg(format!("tokenizer from file error {}", e)))?;
 
@@ -1229,34 +1317,44 @@ fn main() -> Result<()> {
     let config = LLMConfig::default()?;
 
     // 创建数据集和数据加载器
-    let token_dataset = TokenDataset::new(
-        text,
+    let val_text = read_text("src/assets/sub_wiki_0_99.txt");
+    let val_dataset = TokenDataset::new(
+        val_text,
         &tokenizer,
         config.max_context,
         config.max_context,
         &device,
     )?;
-    let mut dataloader = DataLoader::new(token_dataset, batch_size, true)?; // 启用随机打乱
-    let _ = dataloader.reset()?; // 重置数据加载器
-    let (x, _y) = dataloader.next().unwrap()?; // 获取第一个批次的数据
+    let mut val_loader = DataLoader::new(val_dataset, batch_size, false)?;
+
+    let train_text = read_text("src/assets/sub_wiki_0_99.txt");
+    let train_dataset = TokenDataset::new(
+        train_text,
+        &tokenizer,
+        config.max_context,
+        config.max_context,
+        &device,
+    )?;
+    let mut train_loader = DataLoader::new(train_dataset, batch_size, true)?;
+    let _ = train_loader.reset()?; // 重置数据加载器
 
     let varmap = VarMap::new(); // 创建变量映射
     let vb = VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &device); // 创建变量构建器
-    let mut buffers = SharedBuffer::new()?;
     let mut llm = LLM::new(vb, &config)?;
-    // let _ = print_varmap(&varmap)?;
-    // let output = llm.forward(&x, &mut buffers, false, 0)?;
-    // println!("output: {:?}", output);
-    let token_tensor = encode_str("吃饭了吗", &tokenizer, &device)?;
-    let generate_token = generate_simple(
+    let mut optimizer = AdamW::new_lr(varmap.all_vars(), 1e-4)?;
+    let (_train_loss, _val_loss) = train_model(
         &mut llm,
-        &mut buffers,
-        &token_tensor,
+        &mut train_loader,
+        &mut val_loader,
+        &mut optimizer,
+        &tokenizer,
+        2,
+        10,
+        "蝴蝶梦",
         100,
         config.max_context,
+        &device,
     )?;
-    let str = decode_tokens(&generate_token, &tokenizer)?;
-    println!("{}", str);
 
     Ok(())
 }
