@@ -1,7 +1,7 @@
 use core::f32;
 use std::collections::HashMap;
 
-use candle_core::{D, DType, Device, Error, Result, Tensor};
+use candle_core::{D, DType, Device, Error, IndexOp, Result, Tensor};
 use candle_nn::{Linear, Module, VarBuilder, VarMap, embedding, linear_no_bias, ops};
 use rand::seq::SliceRandom;
 use tokenizers::Tokenizer;
@@ -100,6 +100,19 @@ impl SinusoidalPositionEmbedding {
     }
 }
 
+pub fn apply_sin_cos(x: &Tensor, sin: &Tensor, cos: &Tensor) -> Result<Tensor> {
+    let (_, _, _, head_dim) = x.dims4()?;
+    let half_dim = head_dim / 2;
+    let x1 = x.narrow(D::Minus1, 0, half_dim)?;
+    let x2 = x.narrow(D::Minus1, half_dim, half_dim)?;
+    let x2 = x2.affine(-1.0, 0.0)?;
+    let rotate_x = Tensor::cat(&[&x2, &x1], D::Minus1)?;
+    let x_cos = x.broadcast_mul(&cos)?;
+    let x_sin = rotate_x.broadcast_mul(&sin)?;
+    let rotate = x_cos.add(&x_sin)?;
+    Ok(rotate)
+}
+
 pub struct RoPE {
     sin: Tensor,
     cos: Tensor,
@@ -133,17 +146,21 @@ impl RoPE {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        println!("x: {x}");
-        let x_cos = x.broadcast_mul(&self.cos)?;
-        let dims = x.dims();
-        let half_dim = dims[dims.len() - 1] / 2;
-        let x1 = x.narrow(D::Minus1, 0, half_dim)?;
-        let x2 = x.narrow(D::Minus1, half_dim, half_dim)?;
-        let x2 = x2.affine(-1.0, 0.0)?;
-        let rotate_x = Tensor::cat(&[&x2, &x1], D::Minus1)?;
-        println!("rotate_x: {rotate_x}");
-        let x_sin = rotate_x.broadcast_mul(&self.sin)?;
-        let rotate = x_cos.add(&x_sin)?;
+        let rotate = apply_sin_cos(x, &self.sin, &self.cos)?;
+        Ok(rotate)
+    }
+
+    pub fn apply(&self, x: &Tensor, pos_idx: usize) -> Result<Tensor> {
+        let (_, _, seq_len, _) = x.dims4()?;
+        let (rope_seq_len, _) = self.cos.dims2()?;
+        assert!(
+            rope_seq_len >= (pos_idx + seq_len),
+            "rope_seq_len less than pos_idx + seq_len"
+        );
+
+        let cos = self.cos.narrow(0, pos_idx, seq_len)?;
+        let sin = self.sin.narrow(0, pos_idx, seq_len)?;
+        let rotate = apply_sin_cos(x, &sin, &cos)?;
         Ok(rotate)
     }
 
@@ -247,9 +264,15 @@ pub struct DotProductAttention {
 }
 
 pub fn mask_filled(on_true: &Tensor, mask: &Tensor, on_false: f32) -> Result<Tensor> {
+    let (mask_seq_len, _) = mask.dims2()?;
+    let (_, _, seq_len, _) = on_true.dims4()?;
+    assert!(
+        mask_seq_len >= seq_len,
+        "mask seq_len less than input data seq_len"
+    );
+    let mask = mask.i((..seq_len, ..seq_len))?;
     let mask = mask.broadcast_as(on_true.shape())?;
     let on_false = Tensor::new(on_false, on_true.device())?.broadcast_as(on_true.shape())?;
-    println!("{:?}", on_false);
     let filled = mask.where_cond(on_true, &on_false)?;
     Ok(filled)
 }
@@ -349,6 +372,8 @@ impl MultiHeadAttention {
         n_head: usize,
         device: &Device,
     ) -> Result<Self> {
+        assert_eq!(out_dim % n_head, 0, "out_dim must be divisible by n_head");
+
         let w_q = linear_no_bias(in_dim, out_dim, vb.pp("w_q"))?;
         let w_k = linear_no_bias(in_dim, out_dim, vb.pp("w_k"))?;
         let w_v = linear_no_bias(in_dim, out_dim, vb.pp("w_v"))?;
@@ -488,6 +513,225 @@ impl MultiHeadAttention {
     }
 }
 
+pub struct GroupAttention {
+    w_q: Linear,
+    w_k: Linear,
+    w_v: Linear,
+    out_proj: Linear,
+    n_head: usize,
+    n_kv_head: usize,
+    group_size: usize,
+    head_dim: usize,
+    out_dim: usize,
+    d_sqrt: Tensor,
+}
+
+impl GroupAttention {
+    pub fn new(
+        vb: VarBuilder,
+        in_dim: usize,
+        out_dim: usize,
+        n_head: usize,
+        n_kv_head: usize,
+        device: &Device,
+    ) -> Result<Self> {
+        assert_eq!(out_dim % n_head, 0, "out_dim must be divisible by n_head");
+        assert_eq!(
+            n_head % n_kv_head,
+            0,
+            "n_head must be divisible by n_kv_head"
+        );
+
+        let head_dim = out_dim / n_head;
+        let w_q = linear_no_bias(in_dim, out_dim, vb.pp("w_q"))?;
+        let w_k = linear_no_bias(in_dim, n_kv_head * head_dim, vb.pp("w_k"))?;
+        let w_v = linear_no_bias(in_dim, n_kv_head * head_dim, vb.pp("w_v"))?;
+        let out_proj = linear_no_bias(out_dim, out_dim, vb.pp("out_proj"))?;
+        let group_size = n_head / n_kv_head;
+        let d_sqrt = 1.0 / (head_dim as f32).sqrt();
+        let d_sqrt = Tensor::new(d_sqrt, device)?;
+
+        Ok(Self {
+            w_q,
+            w_k,
+            w_v,
+            out_proj,
+            n_head,
+            n_kv_head,
+            group_size,
+            head_dim,
+            out_dim,
+            d_sqrt,
+        })
+    }
+
+    pub fn forward(&self, x: &Tensor, buffer: &mut SharedBuffer) -> Result<Tensor> {
+        let (bs, seq_len, _) = x.dims3()?;
+        let (mask, rope) = buffer.get(seq_len, self.head_dim, x.device())?;
+        // (bs, n_head, seq_len, head_dim)
+        let q = self
+            .w_q
+            .forward(x)?
+            .reshape((bs, seq_len, self.n_head, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let k = self
+            .w_k
+            .forward(x)?
+            .reshape((bs, seq_len, self.n_kv_head, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let v = self
+            .w_v
+            .forward(x)?
+            .reshape((bs, seq_len, self.n_kv_head, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+
+        let q = rope.forward(&q)?;
+        let k = rope.forward(&k)?;
+        let k = k.repeat((1, self.group_size, 1, 1))?;
+        let v = rope.forward(&v)?;
+        let v = v.repeat((1, self.group_size, 1, 1))?;
+        let mut atten_score = q.matmul(&k.t()?)?;
+        atten_score = mask_filled(&atten_score, mask, f32::NEG_INFINITY)?;
+        let atten_score = atten_score.broadcast_mul(&self.d_sqrt)?;
+        let softmax = ops::softmax(&atten_score, D::Minus1)?;
+        let atten_weight = softmax.matmul(&v)?; // (bs, n_head, seq_len, head_dim)
+        let atten_weight = atten_weight
+            .transpose(1, 2)?
+            .reshape((bs, seq_len, self.out_dim))?;
+        let out = self.out_proj.forward(&atten_weight)?;
+        Ok(out)
+    }
+}
+
+// 推理时需要使用 k/v cache
+pub struct GroupAttentionWithKVCache {
+    w_q: Linear,
+    w_k: Linear,
+    w_v: Linear,
+    out_proj: Linear,
+    n_head: usize,
+    n_kv_head: usize,
+    group_size: usize,
+    head_dim: usize,
+    out_dim: usize,
+    max_context: usize,
+    d_sqrt: Tensor,
+    cache_k: Option<Tensor>,
+    cache_v: Option<Tensor>,
+}
+
+impl GroupAttentionWithKVCache {
+    pub fn new(
+        vb: VarBuilder,
+        in_dim: usize,
+        out_dim: usize,
+        n_head: usize,
+        n_kv_head: usize,
+        max_context: usize,
+        device: &Device,
+    ) -> Result<Self> {
+        assert_eq!(out_dim % n_head, 0, "out_dim must be divisible by n_head");
+        assert_eq!(
+            n_head % n_kv_head,
+            0,
+            "n_head must be divisible by n_kv_head"
+        );
+
+        let head_dim = out_dim / n_head;
+        let w_q = linear_no_bias(in_dim, out_dim, vb.pp("w_q"))?;
+        let w_k = linear_no_bias(in_dim, n_kv_head * head_dim, vb.pp("w_k"))?;
+        let w_v = linear_no_bias(in_dim, n_kv_head * head_dim, vb.pp("w_v"))?;
+        let out_proj = linear_no_bias(out_dim, out_dim, vb.pp("out_proj"))?;
+        let group_size = n_head / n_kv_head;
+        let d_sqrt = 1.0 / (head_dim as f32).sqrt();
+        let d_sqrt = Tensor::new(d_sqrt, device)?;
+
+        Ok(Self {
+            w_q,
+            w_k,
+            w_v,
+            out_proj,
+            n_head,
+            n_kv_head,
+            max_context,
+            group_size,
+            head_dim,
+            out_dim,
+            d_sqrt,
+            cache_k: None,
+            cache_v: None,
+        })
+    }
+
+    pub fn forward(
+        &mut self,
+        x: &Tensor,
+        buffer: &mut SharedBuffer,
+        use_cache: bool,
+        pos_idx: usize,
+    ) -> Result<Tensor> {
+        let (bs, seq_len, _) = x.dims3()?;
+        let (mask, rope) = buffer.get(self.max_context, self.head_dim, x.device())?;
+        // (bs, n_head, seq_len, head_dim)
+        let mut q = self
+            .w_q
+            .forward(x)?
+            .reshape((bs, seq_len, self.n_head, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let mut k = self
+            .w_k
+            .forward(x)?
+            .reshape((bs, seq_len, self.n_kv_head, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let mut v = self
+            .w_v
+            .forward(x)?
+            .reshape((bs, seq_len, self.n_kv_head, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+
+        if use_cache {
+            q = rope.apply(&q, pos_idx)?;
+            k = rope.apply(&k, pos_idx)?;
+            if self.cache_k.is_none() {
+                self.cache_k = Some(k.clone());
+                self.cache_v = Some(v.clone());
+            } else {
+                if let Some(cache_k_) = &self.cache_k {
+                    k = Tensor::cat(&[cache_k_, &k], D::Minus2)?;
+                    self.cache_k = Some(k.clone());
+                }
+                if let Some(cache_v_) = &self.cache_v {
+                    v = Tensor::cat(&[cache_v_, &v], D::Minus2)?;
+                    self.cache_v = Some(v.clone());
+                }
+            }
+        } else {
+            q = rope.forward(&q)?;
+            k = rope.forward(&k)?;
+        }
+        let k = k.repeat((1, self.group_size, 1, 1))?;
+        let v = v.repeat((1, self.group_size, 1, 1))?;
+        let mut atten_score = q.matmul(&k.t()?)?;
+        if seq_len != 1 {
+            atten_score = mask_filled(&atten_score, mask, f32::NEG_INFINITY)?;
+        }
+        let atten_score = atten_score.broadcast_mul(&self.d_sqrt)?;
+        let softmax = ops::softmax(&atten_score, D::Minus1)?;
+        let atten_weight = softmax.matmul(&v)?; // (bs, n_head, seq_len, head_dim)
+        let atten_weight = atten_weight
+            .transpose(1, 2)?
+            .reshape((bs, seq_len, self.out_dim))?;
+        let out = self.out_proj.forward(&atten_weight)?;
+        Ok(out)
+    }
+}
+
 fn main() -> Result<()> {
     let device = Device::metal_if_available(0)?;
 
@@ -510,11 +754,46 @@ fn main() -> Result<()> {
     let embedding = embedding(vocab_size, embedding_dim, vb.pp("embedding"))?;
     let encode = embedding.forward(&x)?;
     let n_head = 4;
-    let mha =
-        MultiHeadAttention::new(vb.pp("mha1"), embedding_dim, embedding_dim, n_head, &device)?;
+    let n_kv_head = 2;
     let mut buffer = SharedBuffer::new()?;
-    let output = mha.forward_with_buffer(&encode, &mut buffer)?;
-    println!("{:?}", output);
+    let mut attention = GroupAttentionWithKVCache::new(
+        vb.pp("self_attn"),
+        embedding_dim,
+        embedding_dim,
+        n_head,
+        n_kv_head,
+        seq_len,
+        &device,
+    )?;
+    let output = attention.forward(&encode, &mut buffer, false, 0)?;
+    // let ga = GroupAttention::new(
+    //     vb.pp("ga1"),
+    //     embedding_dim,
+    //     embedding_dim,
+    //     n_head,
+    //     n_kv_head,
+    //     &device,
+    // )?;
+    // let output = ga.forward(&encode, &mut buffer)?;
+    // let mha =
+    //     MultiHeadAttention::new(vb.pp("mha1"), embedding_dim, embedding_dim, n_head, &device)?;
+    // let output = mha.forward_with_buffer(&encode, &mut buffer)?;
+    println!("output:{:?}", output);
 
+    let encode = tokenizer
+        .encode("你好，你好可爱啊", true)
+        .map_err(|e| Error::Msg(format!("tokenizer failed: {}", e)))?;
+    let token_ids = encode.get_ids();
+    let token_tensor = Tensor::new(token_ids, &device)?;
+    let token_tensor = token_tensor.unsqueeze(0)?;
+    let encode = embedding.forward(&token_tensor)?;
+    let output = attention.forward(&encode, &mut buffer, true, 0)?;
+    println!("output:{:?}", output);
+    let pos_idx = token_ids.len();
+    let token_tensor = Tensor::new(3589 as u32, &device)?;
+    let token_tensor = token_tensor.unsqueeze(0)?.unsqueeze(0)?;
+    let encode = embedding.forward(&token_tensor)?;
+    let output = attention.forward(&encode, &mut buffer, true, pos_idx)?;
+    println!("output:{:?}", output);
     Ok(())
 }
