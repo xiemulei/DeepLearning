@@ -741,15 +741,18 @@ impl<B: Backend> LLM<B> {
     /// # 数据维度
     /// input_ids: [batch_size, seq_len]
     /// target_ids: [batch_size, seq_len]
-    /// logits_flat: [batch_size * seq_len, vocab_size]
+    /// logits: [batch_size * seq_len, vocab_size]
     /// targets_flat: [batch_size * seq_len]
     /// 
     /// # 损失计算
     /// 使用交叉熵损失计算预测与目标之间的差异
+    /// 交叉熵损失要求：
+    /// - logits: [batch_size * seq_len, vocab_size]（每个位置预测词汇表）
+    /// - targets: [batch_size * seq_len]（每个位置的真实token ID）
     /// 
     /// # 参数说明
-    /// * `input_ids`: 输入token IDs
-    /// * `target_ids`: 目标token IDs
+    /// * `input_ids`: 输入token IDs，维度: [batch_size, seq_len]
+    /// * `target_ids`: 目标token IDs，维度: [batch_size, seq_len]
     /// 
     /// # 返回
     /// 包含损失、logits和目标的ClassificationOutput
@@ -759,27 +762,26 @@ impl<B: Backend> LLM<B> {
         target_ids: Tensor<B, 2, Int>,
     ) -> ClassificationOutput<B> {
         // 前向传播获取logits
+        // logits维度: [batch_size * seq_len, vocab_size]
+        // 例如：[4 * 256, 151669] = [1024, 151669]
         let logits = self.forward(input_ids);
 
-        // ============ 展平以计算损失 ============
-        // logits: [batch_size * seq_len, vocab_size]
-        // logits_flat: [batch_size * seq_len, vocab_size]
-        let logits_flat = logits.clone().flatten::<2>(0, 1);
-
+        // ============ 展平target_ids以计算损失 ============
         // target_ids: [batch_size, seq_len]
-        // targets_2d: [batch_size * seq_len, embedding_dim]
-        let targets_2d = target_ids.clone().flatten::<2>(0, 1);
-
-        // targets_flat: [batch_size * seq_len]
-        let targets_flat = targets_2d.flatten::<1>(0, 1);
+        // 例如：[4, 256]
+        // 需要展平为1D张量: [batch_size * seq_len]
+        // 例如：[1024]
+        let targets_flat = target_ids.flatten::<1>(0, 1);
 
         // ============ 计算交叉熵损失 ============
-        // 损失衡量模型预测与真实目标的差异
+        // logits: [batch_size * seq_len, vocab_size]
+        // targets_flat: [batch_size * seq_len]
+        // 损失计算：对于每个位置，计算预测分布与真实token的交叉熵
         let loss = burn::nn::loss::CrossEntropyLossConfig::new()
             .init(&logits.device())
-            .forward(logits_flat.clone(), targets_flat.clone());
+            .forward(logits.clone(), targets_flat.clone());
 
-        ClassificationOutput::new(loss, logits_flat, targets_flat)
+        ClassificationOutput::new(loss, logits, targets_flat)
     }
 }
 
