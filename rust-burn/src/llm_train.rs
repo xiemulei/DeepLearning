@@ -18,7 +18,7 @@ pub fn train_llm_main(text_path: &str, tokenizer_path: &str, artifact_dir: &str)
     let train_dataset = TokenDataset::new_with_tokenizer(
         text_path,
         tokenizer_path,
-        512, // seq_len
+        256, // seq_len
         256, // stride
     )
     .expect("Failed to create train dataset");
@@ -27,7 +27,7 @@ pub fn train_llm_main(text_path: &str, tokenizer_path: &str, artifact_dir: &str)
     let val_dataset = TokenDataset::new_with_tokenizer(
         text_path,
         tokenizer_path,
-        512, // seq_len
+        256, // seq_len
         256, // stride
     )
     .expect("Failed to create validation dataset");

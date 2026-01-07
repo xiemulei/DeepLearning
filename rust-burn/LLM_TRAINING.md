@@ -36,10 +36,7 @@
 cd rust-burn
 
 # 训练LLM
-cargo run --release -- train-llm \
-  --text src/assets/sub_wiki_0_99.txt \
-  --tokenizer src/assets/tokenizer.json \
-  --artifact-dir ../tmp/llm
+cargo run --release -- train-llm   --text src/assets/sub_wiki_0_99.txt   --tokenizer src/assets/tokenizer.json   --artifact-dir ../tmp/llm
 ```
 
 ### 3. 查看训练进度

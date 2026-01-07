@@ -44,16 +44,31 @@ impl TokenDataset {
         let tokens: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
 
         let token_len = tokens.len();
-        let max_token_id = if token_len > seq_len {
-            token_len - seq_len
-        } else {
-            0
-        };
+
+        // Need at least seq_len + 1 tokens (input + target)
+        if token_len < seq_len + 1 {
+            return Err(format!(
+                "Not enough tokens: {} tokens available, need at least {} (seq_len={} + 1 target)",
+                token_len,
+                seq_len + 1,
+                seq_len
+            )
+            .into());
+        }
+
+        // The last valid starting index is token_len - seq_len - 1
+        let max_start_idx = token_len - seq_len - 1;
+        let effective_stride = if stride == 0 { 1 } else { stride };
 
         let mut items = Vec::new();
 
         // 滑动窗口创建训练样本
-        for i in (0..max_token_id).step_by(stride) {
+        for i in (0..=max_start_idx).step_by(effective_stride) {
+            // Ensure we have enough tokens for both input and target
+            if i + seq_len + 1 > token_len {
+                break;
+            }
+
             let input_ids = tokens[i..i + seq_len].to_vec();
             let target_ids = tokens[i + 1..i + seq_len + 1].to_vec();
 
@@ -63,11 +78,24 @@ impl TokenDataset {
             });
         }
 
+        if items.is_empty() {
+            // Create at least one sample if possible
+            if token_len >= seq_len + 1 {
+                let input_ids = tokens[0..seq_len].to_vec();
+                let target_ids = tokens[1..seq_len + 1].to_vec();
+                items.push(TokenDatasetItem {
+                    input_ids,
+                    target_ids,
+                });
+            }
+        }
+
         println!(
-            "创建了 {} 个训练样本 (seq_len={}, stride={})",
+            "创建了 {} 个训练样本 (seq_len={}, stride={}, total_tokens={})",
             items.len(),
             seq_len,
-            stride
+            stride,
+            token_len
         );
 
         Ok(TokenDataset {
@@ -302,6 +330,7 @@ pub struct LLMConfig {
 }
 
 impl LLMConfig {
+    #[allow(unused)]
     pub fn default() -> Self {
         Self::new(151669, 512, 8, 8, 4, 512, 1024, 1e-6)
     }
@@ -341,7 +370,6 @@ impl LLMConfig {
 
 impl<B: Backend> LLM<B> {
     pub fn forward(&self, x: Tensor<B, 2, Int>) -> Tensor<B, 2> {
-        let [batch_size, seq_len] = x.dims();
         let mut x = self.embedding.forward(x);
 
         // For now, we'll pass None as mask - in a real implementation you'd create a causal mask
@@ -373,45 +401,9 @@ impl<B: Backend> LLM<B> {
     }
 }
 
-#[derive(Module, Debug)]
-pub struct LLMClassification<B: Backend> {
-    llm: LLM<B>,
-}
-
-impl<B: Backend> LLMClassification<B> {
-    pub fn new(config: LLMConfig, device: &B::Device) -> Self {
-        Self {
-            llm: config.init(device),
-        }
-    }
-
-    pub fn forward_classification(
-        &self,
-        input_ids: Tensor<B, 2, Int>,
-        target_ids: Tensor<B, 2, Int>,
-    ) -> ClassificationOutput<B> {
-        let logits = self.llm.forward(input_ids);
-        let targets_2d = target_ids.flatten::<2>(0, 1);
-        let targets_flat = targets_2d.flatten::<1>(0, 1);
-        let loss = burn::nn::loss::CrossEntropyLossConfig::new()
-            .init(&logits.device())
-            .forward(logits.clone(), targets_flat.clone());
-
-        ClassificationOutput::new(loss, logits, targets_flat)
-    }
-}
-
-impl<B: Backend> LLM<B> {
-    pub fn generate(&self, _input_ids: Tensor<B, 2>, _max_generate: usize) -> Tensor<B, 2> {
-        // TODO: Implement generation logic
-        todo!("Generation not implemented yet")
-    }
-}
-
 // Training implementation
 use burn::{
     data::dataloader::DataLoaderBuilder,
-    optim::AdamConfig,
     record::CompactRecorder,
     tensor::backend::AutodiffBackend,
     train::{LearnerBuilder, TrainOutput, TrainStep, ValidStep, metric::LossMetric},
