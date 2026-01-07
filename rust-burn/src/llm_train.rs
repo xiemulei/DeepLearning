@@ -1,6 +1,6 @@
 use burn::{
     backend::{Autodiff, Wgpu},
-    optim::AdamConfig,
+    optim::AdamWConfig,
 };
 
 use crate::llm::{LLMConfig, LLMTrainingConfig, TokenDataset, train_llm};
@@ -51,7 +51,7 @@ pub fn train_llm_main(text_path: &str, tokenizer_path: &str, artifact_dir: &str)
     // 训练配置
     let training_config = LLMTrainingConfig {
         model: model_config,
-        optimizer: AdamConfig::new(),
+        optimizer: AdamWConfig::new(),
         num_epochs: 10,
         batch_size: 4,
         num_workers: 0,

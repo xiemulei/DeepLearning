@@ -4,7 +4,7 @@ use burn::{
 };
 use clap::{Parser, Subcommand};
 
-use crate::{model::ModelConfig, training::TrainingConfig, llm_train::train_llm_main};
+use crate::{llm_train::train_llm_main, model::ModelConfig, training::TrainingConfig};
 
 mod data;
 mod inference;
@@ -55,7 +55,11 @@ fn main() {
         Commands::TrainImage => {
             train_image_classification();
         }
-        Commands::TrainLlm { text, tokenizer, artifact_dir } => {
+        Commands::TrainLlm {
+            text,
+            tokenizer,
+            artifact_dir,
+        } => {
             train_llm_main(&text, &tokenizer, &artifact_dir);
         }
         Commands::Infer { image, size } => {
@@ -100,13 +104,8 @@ fn run_inference(image_path: &str, img_size: usize) {
 
     println!("正在推理: {}", image_path);
 
-    let pred = crate::inference::infer::<MyBackend>(
-        artifact_dir,
-        &device,
-        image_path,
-        img_size,
-    )
-    .unwrap();
+    let pred =
+        crate::inference::infer::<MyBackend>(artifact_dir, &device, image_path, img_size).unwrap();
 
     println!("预测结果: {pred} (0=Cat, 1=Dog)");
 }

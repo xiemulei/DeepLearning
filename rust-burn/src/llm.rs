@@ -2,15 +2,16 @@ use burn::{
     data::{dataloader::batcher::Batcher, dataset::Dataset},
     module::Module,
     nn::{
-        Dropout, DropoutConfig, Embedding, EmbeddingConfig, Gelu, Linear, LinearConfig, RmsNorm,
-        RmsNormConfig, RotaryEncoding, RotaryEncodingConfig,
+        Embedding, EmbeddingConfig, Gelu, Linear, LinearConfig, RmsNorm, RmsNormConfig,
+        RotaryEncoding, RotaryEncodingConfig,
     },
+    optim::AdamWConfig,
     prelude::*,
     tensor::{Tensor, activation::softmax},
     train::ClassificationOutput,
 };
-use tokenizers::Tokenizer;
 use std::fs;
+use tokenizers::Tokenizer;
 
 #[derive(Debug, Clone)]
 pub struct TokenDatasetItem {
@@ -62,7 +63,12 @@ impl TokenDataset {
             });
         }
 
-        println!("创建了 {} 个训练样本 (seq_len={}, stride={})", items.len(), seq_len, stride);
+        println!(
+            "创建了 {} 个训练样本 (seq_len={}, stride={})",
+            items.len(),
+            seq_len,
+            stride
+        );
 
         Ok(TokenDataset {
             items,
@@ -427,7 +433,7 @@ impl<B: Backend> ValidStep<TokenBatch<B>, ClassificationOutput<B>> for LLM<B> {
 #[derive(Config, Debug)]
 pub struct LLMTrainingConfig {
     pub model: LLMConfig,
-    pub optimizer: AdamConfig,
+    pub optimizer: AdamWConfig,
     #[config(default = 10)]
     pub num_epochs: usize,
     #[config(default = 8)]
